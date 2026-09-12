@@ -75,6 +75,7 @@ class PipelineMetadata:
     width: int
     height: int
     offset: list
+    imu_to_cam: object = None # 3x3, resolved from the camera model
 
 
 # ============================================================
@@ -339,12 +340,21 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         # HEVC streams often carry no nb_frames; the camera records the count.
         frame_count = int(meta.get('total_frames') or 0)
 
+    camera_type = meta.get('camera_type', '')
+    imu_to_cam = IMU_TO_CAM_BY_CAMERA.get(camera_type)
+    if imu_to_cam is None:
+        print(f"  WARNING: no IMU_TO_CAM for {camera_type!r}, falling back to "
+              "the X5 matrix. Stabilization will be wrong; use --no-stab or "
+              "re-solve against a Studio render.")
+        imu_to_cam = IMU_TO_CAM
+
     return PipelineMetadata(
         lens_params=lenses,
         imu_samples=imu_samples, fps=fps_val,
         frame_count=frame_count,
         frame_readout_time=frame_readout_time,
         width=width, height=height, offset=offset,
+        imu_to_cam=imu_to_cam,
     )
 
 
@@ -367,10 +377,28 @@ IMU_TO_CAM = np.array([
     [ 0.3060, -0.6511, -0.6946],
 ], dtype=np.float64)
 
+# PROVISIONAL. Fitted for the X6 the same way, against an 8K equirectangular
+# Insta360 Studio render used as ground truth: each frame of our own unlevelled
+# render is aligned to the Studio frame photometrically, the resulting rotation
+# gives the true up direction in camera frame, and Wahba is solved against the
+# smoothed accelerometer. Residuals were 2.0 deg median on the only clip
+# available so far, and that clip has the camera being handled rather than
+# ridden, so this needs re-solving on steady footage.
+IMU_TO_CAM_X6 = np.array([
+    [ 0.099100,  0.142204,  0.984864],
+    [ 0.892420,  0.425125, -0.151182],
+    [-0.440189,  0.893894, -0.084776],
+], dtype=np.float64)
 
-def imu_to_camera(vec):
+IMU_TO_CAM_BY_CAMERA = {
+    'Insta360 X5': IMU_TO_CAM,
+    'Insta360 X6': IMU_TO_CAM_X6,
+}
+
+
+def imu_to_camera(vec, M=None):
     """Transform a vector from IMU frame to camera image frame."""
-    return IMU_TO_CAM @ np.asarray(vec)
+    return (IMU_TO_CAM if M is None else M) @ np.asarray(vec)
 
 
 def compute_gravity_orientation(accel_cam):
@@ -394,7 +422,7 @@ def compute_gravity_orientation(accel_cam):
 
 
 def compute_stabilization_from_imu(
-    imu_samples, fps, tau=1.5, smoothing_sec=0.3
+    imu_samples, fps, tau=1.5, smoothing_sec=0.3, imu_to_cam=None
 ):
     """
     Compute per-frame horizon-lock stabilization using complementary filter.
@@ -418,8 +446,9 @@ def compute_stabilization_from_imu(
                           for s in imu_samples])
 
     # Convert to camera frame
-    accels_cam = (IMU_TO_CAM @ accels_imu.T).T
-    gyros_cam = (IMU_TO_CAM @ gyros_imu.T).T
+    M = IMU_TO_CAM if imu_to_cam is None else imu_to_cam
+    accels_cam = (M @ accels_imu.T).T
+    gyros_cam = (M @ gyros_imu.T).T
 
     # Smooth accelerometer to filter out dynamic forces.
     # A window of ~50 samples (~250ms at 200Hz) balances noise reduction
@@ -448,7 +477,8 @@ def compute_stabilization_from_imu(
 
 
 def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
-                         n_scanlines=32, apply_leveling=True):
+                         n_scanlines=32, apply_leveling=True,
+                         imu_to_cam=None):
     """
     Compute per-scanline orientation for rolling shutter correction.
 
@@ -475,8 +505,9 @@ def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
     accels_imu = np.array([[s['accl'][0], s['accl'][1], s['accl'][2]]
                            for s in imu_samples])
 
-    gyros_cam = (IMU_TO_CAM @ gyros_imu.T).T
-    accels_cam = (IMU_TO_CAM @ accels_imu.T).T
+    M = IMU_TO_CAM if imu_to_cam is None else imu_to_cam
+    gyros_cam = (M @ gyros_imu.T).T
+    accels_cam = (M @ accels_imu.T).T
 
     # Smoothed gravity for base orientation
     smooth_window = min(50, len(imu_samples))
@@ -1034,7 +1065,8 @@ class X5Pipeline:
         print("[2/4] Computing IMU stabilization...")
         if enable_stabilization:
             self.stab_corrections = compute_stabilization_from_imu(
-                self.meta.imu_samples, self.meta.fps)
+                self.meta.imu_samples, self.meta.fps,
+                imu_to_cam=self.meta.imu_to_cam)
             print(f"  {len(self.stab_corrections)} frame corrections computed")
         else:
             self.stab_corrections = {}
@@ -1058,7 +1090,8 @@ class X5Pipeline:
         rs_rots = compute_rs_rotations(
             self.meta.imu_samples, frame_idx, self.meta.fps,
             self.meta.frame_readout_time, n_scanlines=32,
-            apply_leveling=self.enable_stabilization)
+            apply_leveling=self.enable_stabilization,
+            imu_to_cam=self.meta.imu_to_cam)
 
         self.maps = []
         for lens in self.meta.lens_params:
