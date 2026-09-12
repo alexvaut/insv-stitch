@@ -8,6 +8,7 @@ Dual fisheye → equirectangular with IMU-based stabilization.
 
 import numpy as np
 import cv2
+import os
 import subprocess
 import time
 import re
@@ -92,9 +93,37 @@ def _find_pb_path(insv_path: str) -> str | None:
     return None
 
 
+# Every .insv ends with this ASCII magic, preceded by the trailer size.
+INSV_TRAILER_MAGIC = b'8db42d694ccc418790edff439fe026bf'
+
+
+def _scan_calibration_string(text: str) -> list[float] | None:
+    """
+    Scan decoded text for the extended calibration string.
+
+    Format is "<num_lenses>_<float>_<float>_...", 27 elements per lens plus a
+    leading count. Returns the parsed float values, or None if not found.
+    """
+    # Find calibration strings: "2_<numbers...>" with >40 elements
+    for match in re.finditer(r'2_[\d]+\.[\d]+_', text):
+        start = match.start()
+        # Extract the full numeric string
+        chunk = text[start:]
+        parts = []
+        for token in chunk.split('_'):
+            try:
+                parts.append(float(token))
+            except ValueError:
+                break
+        if len(parts) >= 55:  # Extended format has 56 elements
+            return parts
+
+    return None
+
+
 def _parse_extended_calibration(pb_path: str) -> list[float] | None:
     """
-    Extract the extended 56-element calibration string from a .pb file.
+    Extract the extended 56-element calibration from a .pb sidecar (X5).
     Returns the parsed float values, or None if not found.
     """
     with open(pb_path, 'rb') as f:
@@ -108,31 +137,52 @@ def _parse_extended_calibration(pb_path: str) -> list[float] | None:
         return None
 
     decoded = base64.b64decode(b64_match.group()).decode('latin-1')
-
-    # Find calibration strings: "2_<numbers...>" with >40 elements
-    for match in re.finditer(r'2_[\d]+\.[\d]+_', decoded):
-        start = match.start()
-        # Extract the full numeric string
-        chunk = decoded[start:]
-        parts = []
-        for token in chunk.split('_'):
-            try:
-                parts.append(float(token))
-            except ValueError:
-                break
-        if len(parts) >= 55:  # Extended format has 56 elements
-            return parts
-
-    return None
+    return _scan_calibration_string(decoded)
 
 
-def _sensor_to_video(fx, fy, cx, cy, sensor_w=5376, video_w=3840, cx_fix=2.0):
-    """Convert calibration values from sensor resolution to video resolution."""
-    crop_info_dst = 5312  # window_crop_info dst_width
-    scale = video_w / crop_info_dst
-    # cx_fix=2 for X5: cx is halved in Gyroflow convention, we double it
-    cx_v = cx * video_w / (sensor_w * cx_fix) * cx_fix  # = cx * video_w / sensor_w
-    cy_v = cy * video_w / sensor_w
+def _read_insv_trailer_calibration(insv_path: str) -> list[float] | None:
+    """
+    Extract the extended calibration from the .insv metadata trailer (X6).
+
+    The X6 writes no .pb sidecar, but stores the same 56-element string as
+    plain text inside the trailer. The file ends with:
+        [...trailer...][extra_size uint32 LE][version uint32 LE][magic 32 ASCII]
+    """
+    with open(insv_path, 'rb') as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        if file_size < 40:
+            return None
+
+        f.seek(file_size - 32)
+        if f.read(32) != INSV_TRAILER_MAGIC:
+            return None
+
+        f.seek(file_size - 40)
+        extra_size = int.from_bytes(f.read(4), 'little')
+        if not 0 < extra_size <= file_size:
+            return None
+
+        f.seek(file_size - extra_size)
+        trailer = f.read(extra_size)
+
+    return _scan_calibration_string(trailer.decode('latin-1'))
+
+
+def _sensor_to_video(fx, fy, cx, cy, sensor_w, crop_dst, video_w):
+    """
+    Convert calibration values from sensor resolution to video resolution.
+
+    The per-lens sensor area (sensor_w) is centre-cropped to crop_dst
+    (window_crop_info), then scaled down to video_w. Focal lengths follow the
+    scaling only; the principal point is shifted by the crop first.
+
+    X5: 5376 -> 5312 -> 3840.  X6: 7744 -> 7680 -> 3840.
+    """
+    crop_offset = (sensor_w - crop_dst) / 2.0
+    scale = video_w / crop_dst
+    cx_v = (cx - crop_offset) * scale
+    cy_v = (cy - crop_offset) * scale
     fx_v = fx * scale
     fy_v = fy * scale
     return fx_v, fy_v, cx_v, cy_v
@@ -149,23 +199,44 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
     item = telem[0]
 
     meta = item['Default']['Metadata']
-    lens_data = item['Lens']['Data']
+    # The X6 exposes no 'Lens' block at all; the X5 keeps fisheye_params there.
+    lens_data = item.get('Lens', {}).get('Data', {})
     dim = meta['dimension']
     width, height = dim['x'], dim['y']
     offset = meta['offset']
 
-    # Try to load extended calibration from protobuf sidecar
+    # Extended calibration: .pb sidecar (X5) first, then the .insv trailer (X6).
     pb_path = _find_pb_path(insv_path)
     ext = _parse_extended_calibration(pb_path) if pb_path else None
+    calib_source = 'protobuf sidecar'
+    if not ext:
+        ext = _read_insv_trailer_calibration(insv_path)
+        calib_source = '.insv trailer'
 
     if ext and len(ext) >= 55:
         # ---- Extended 56-element calibration (best available) ----
-        # Format: [0]=num, per lens (27 elements):
+        # Format: [0]=lens count, then 27 elements per lens:
         #   [+0]=xi, [+1]=fx, [+2]=fy, [+3]=cx, [+4]=cy,
-        #   [+5]=yaw, [+6]=pitch, [+7]=roll,
-        #   [+8]=tx, [+9]=ty, [+10]=tz,
+        #   [+5]=yaw, [+6]=pitch, [+7]=see note below,
+        #   [+8..+10]=tx,ty,tz (old/FINDINGS.md reads these as a Rodrigues vector),
         #   [+11..+23]=13 distortion coefficients,
-        #   [+24]=w, [+25]=h, [+26]=type
+        #   [+24]=full dual-fisheye width, [+25]=per-lens width, [+26]=FOV deg
+        # Total is 1 + 2*27 = 55 elements.
+        #
+        # [+7] is ~89.5-90 on both the X5 and the X6, and on both lenses of one
+        # body. The code labelled it roll, old/FINDINGS.md labelled it half_fov.
+        # Neither is obvious: [+26] carries the FOV (193 on X6), so a half-FOV
+        # would read 96.5, not 89.5. A ~90 degree roll does match the X6's
+        # cam_posture=CameraRotate90. Set INSV_CALIB_ROLL=1 to apply it as roll;
+        # the default keeps upstream behaviour and ignores it.
+        apply_roll = os.environ.get('INSV_CALIB_ROLL') == '1'
+
+        # Sensor geometry read from the calibration and window_crop_info rather
+        # than hardcoded: X5 is 5376->5312, X6 is 7744->7680, both down to 3840.
+        sensor_w = ext[1 + 25]
+        crop = meta.get('window_crop_info') or {}
+        crop_dst = float(crop.get('dst_width') or sensor_w)
+
         lenses = []
         for lens_idx in range(2):
             s = 1 + lens_idx * 27
@@ -178,15 +249,18 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
 
             # Convert to video resolution
             if lens_idx == 1:
-                cx_s -= 5376  # Remove concatenated offset
-            fx_v, fy_v, cx_v, cy_v = _sensor_to_video(fx_s, fy_s, cx_s, cy_s)
+                cx_s -= sensor_w  # Remove concatenated offset
+            fx_v, fy_v, cx_v, cy_v = _sensor_to_video(
+                fx_s, fy_s, cx_s, cy_s, sensor_w, crop_dst, width)
 
-            # Extrinsic rotation (small yaw/pitch corrections only)
+            # Extrinsic rotation (small yaw/pitch corrections, plus roll if enabled)
+            order = 'YXZ' if apply_roll else 'YX'
+            angles = [yaw, pitch, roll] if apply_roll else [yaw, pitch]
             if lens_idx == 0:
-                R = Rotation.from_euler('YX', [yaw, pitch], degrees=True).as_matrix()
+                R = Rotation.from_euler(order, angles, degrees=True).as_matrix()
             else:
                 R_back = Rotation.from_euler('Y', 180, degrees=True)
-                R_corr = Rotation.from_euler('YX', [yaw, pitch], degrees=True)
+                R_corr = Rotation.from_euler(order, angles, degrees=True)
                 R = (R_back * R_corr).as_matrix()
 
             lens = MEILensParams(
@@ -199,9 +273,21 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
             )
             lenses.append(lens)
 
-        print(f"  Using extended protobuf calibration (13 coefficients per lens)")
+        print(f"  Using extended calibration from {calib_source} "
+              f"(13 coefficients per lens, xi={lenses[0].xi:.5f}, "
+              f"sensor {sensor_w:.0f}->{crop_dst:.0f}->{width}"
+              f"{', roll applied' if apply_roll else ''})")
     else:
         # ---- Fallback: Gyroflow / offset_v3 (5-coeff model) ----
+        if not lens_data or not offset:
+            raise RuntimeError(
+                f"No lens calibration available for {insv_path}.\n"
+                "  - nothing in a .pb sidecar, nothing in the .insv trailer\n"
+                "  - no Gyroflow offset_v3 fallback either (Lens block "
+                f"{'present' if lens_data else 'missing'}, offset "
+                f"{'present' if offset else 'empty'})\n"
+                f"  camera reported as: {meta.get('camera_type', 'unknown')}"
+            )
         fp = lens_data['fisheye_params']
         dc = fp['distortion_coeffs']
         cm = fp['camera_matrix']
@@ -239,7 +325,10 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
 
     imu_samples = tp.normalized_imu()
     fps_val = float(meta.get('frame_rate', 30))
-    frame_readout_time = lens_data.get('frame_readout_time', 21.24)
+    # The X5 reports this under Lens.Data; the X6 only has Default.Metadata.
+    frame_readout_time = lens_data.get('frame_readout_time')
+    if frame_readout_time is None:
+        frame_readout_time = float(meta.get('rolling_shutter_time') or 21.24)
 
     cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
            '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', insv_path]
@@ -247,7 +336,8 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         frame_count = int(r.stdout.strip())
     except Exception:
-        frame_count = 0
+        # HEVC streams often carry no nb_frames; the camera records the count.
+        frame_count = int(meta.get('total_frames') or 0)
 
     return PipelineMetadata(
         lens_params=lenses,
@@ -358,13 +448,20 @@ def compute_stabilization_from_imu(
 
 
 def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
-                         n_scanlines=32):
+                         n_scanlines=32, apply_leveling=True):
     """
     Compute per-scanline orientation for rolling shutter correction.
 
     During the readout, each row was captured at a different time.
     The gyro angular velocity is integrated to compute the relative
     orientation at each scanline position.
+
+    Because the returned rotation is TOTAL (gravity leveling composed with the
+    gyro delta), and because build_equirect_remap ignores its R_stabilization
+    argument whenever rs_rotations is supplied, this function alone decides
+    whether the output is levelled. Pass apply_leveling=False to keep the pure
+    rolling-shutter delta and leave the camera in its own frame -- without it
+    --no-stab has no effect at all.
 
     Returns: list of (scanline_frac, Rotation) pairs, where the Rotation
         is the TOTAL stabilization rotation at that scanline's capture time.
@@ -393,7 +490,10 @@ def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
     # Base orientation at frame center
     idx_center = np.searchsorted(timestamps, t_frame)
     idx_center = np.clip(idx_center, 0, len(timestamps) - 1)
-    R_base = compute_gravity_orientation(accels_smooth[idx_center])
+    if apply_leveling:
+        R_base = compute_gravity_orientation(accels_smooth[idx_center])
+    else:
+        R_base = Rotation.identity()
 
     # For each scanline, compute the gyro-integrated orientation delta
     # relative to the frame center
@@ -449,6 +549,79 @@ def decode_frame(insv_path, frame_num, track, width, height):
         raise RuntimeError(
             f"Decode failed: got {len(r.stdout)} bytes, expected {expected}")
     return np.frombuffer(r.stdout, dtype=np.uint8).reshape(height, width, 3).copy()
+
+
+class InsvFrameReader:
+    """
+    Sequential dual-track frame reader.
+
+    decode_frame() above spawns one ffmpeg per frame and uses select=eq(n,N)
+    with no seek, so every request re-decodes from frame 0. Measured on an X6
+    clip: 1.04s for frame 0 but 6.02s for frame 150, i.e. quadratic cost over
+    a whole video. Here one ffmpeg process per track stays open and frames are
+    read in order, which measured 0.039s per frame for both tracks.
+
+    Tracks are read from two processes because a single ffmpeg cannot write
+    two rawvideo streams to one pipe.
+    """
+
+    def __init__(self, insv_path, width, height, fps, start_frame=0):
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        self.next_index = start_frame
+        self.procs = []
+        for track in (0, 1):
+            cmd = ['ffmpeg', '-loglevel', 'error', '-i', insv_path,
+                   '-map', f'0:{track}']
+            if start_frame > 0:
+                # Output-side seek: ffmpeg decodes and discards internally,
+                # which is frame-accurate and avoids piping skipped frames.
+                cmd += ['-ss', f'{start_frame / float(fps):.6f}']
+            cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
+            self.procs.append(subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=0))
+
+    def _read_one(self, proc):
+        buf = bytearray(self.frame_size)
+        view = memoryview(buf)
+        got = 0
+        while got < self.frame_size:
+            n = proc.stdout.readinto(view[got:])
+            if not n:
+                return None
+            got += n
+        return np.frombuffer(buf, dtype=np.uint8).reshape(
+            self.height, self.width, 3)
+
+    def read(self):
+        """Return the next (front, back) pair, or None at end of stream."""
+        front = self._read_one(self.procs[0])
+        back = self._read_one(self.procs[1])
+        if front is None or back is None:
+            return None
+        self.next_index += 1
+        return front, back
+
+    def close(self):
+        for proc in self.procs:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        self.procs = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # ============================================================
@@ -849,6 +1022,7 @@ class X5Pipeline:
         self.insv_path = insv_path
         self.eq_w = eq_width
         self.eq_h = eq_width // 2
+        self.enable_stabilization = enable_stabilization
         self.enable_flow = enable_flow
         self.denoise = denoise
 
@@ -878,10 +1052,13 @@ class X5Pipeline:
         """Build remap tables with stabilization + rolling shutter correction."""
         R_stab = self.stab_corrections.get(frame_idx, Rotation.identity())
 
-        # Per-scanline RS correction from gyro data
+        # Per-scanline RS correction from gyro data. Note that rs_rots carries
+        # the gravity leveling too, and build_equirect_remap ignores R_stab
+        # whenever rs_rotations is not None -- so leveling is switched here.
         rs_rots = compute_rs_rotations(
             self.meta.imu_samples, frame_idx, self.meta.fps,
-            self.meta.frame_readout_time, n_scanlines=32)
+            self.meta.frame_readout_time, n_scanlines=32,
+            apply_leveling=self.enable_stabilization)
 
         self.maps = []
         for lens in self.meta.lens_params:
@@ -969,17 +1146,26 @@ class X5Pipeline:
         self.w_front = w_f / total
         self.w_back = w_b / total
 
-    def stitch_frame(self, frame_num=0):
-        """Stitch a single frame with depth-aware translation correction."""
+    def stitch_frame(self, frame_num=0, frames=None):
+        """
+        Stitch a single frame with depth-aware translation correction.
+
+        Pass `frames` as a (front, back) pair to reuse an open
+        InsvFrameReader; otherwise one is opened for this frame alone.
+        """
         t0 = time.time()
 
         if self.stab_corrections:
             self._build_maps(frame_num)
 
-        front = decode_frame(self.insv_path, frame_num, 0,
-                             self.meta.width, self.meta.height)
-        back = decode_frame(self.insv_path, frame_num, 1,
-                            self.meta.width, self.meta.height)
+        if frames is None:
+            with InsvFrameReader(self.insv_path, self.meta.width,
+                                 self.meta.height, self.meta.fps,
+                                 frame_num) as reader:
+                frames = reader.read()
+            if frames is None:
+                raise RuntimeError(f"Decode failed: no frame {frame_num}")
+        front, back = frames
 
         eq_front = remap_fisheye(front, *self.maps[0])
         eq_back = remap_fisheye(back, *self.maps[1])
@@ -1156,9 +1342,19 @@ class X5Pipeline:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
         t_total = time.time()
-        for n in range(start, end):
-            result = self.stitch_frame(n)
-            proc.stdin.write(result.tobytes())
+        reader = InsvFrameReader(self.insv_path, self.meta.width,
+                                 self.meta.height, self.meta.fps, start)
+        try:
+            for n in range(start, end):
+                pair = reader.read()
+                if pair is None:
+                    print(f"  stream ended early at frame {n}")
+                    end = n
+                    break
+                result = self.stitch_frame(n, frames=pair)
+                proc.stdin.write(result.tobytes())
+        finally:
+            reader.close()
 
         proc.stdin.close()
         proc.wait()
