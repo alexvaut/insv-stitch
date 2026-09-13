@@ -16,7 +16,7 @@ import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from scipy.spatial.transform import Rotation, Slerp
-from scipy.ndimage import uniform_filter1d
+from scipy.signal import butter, filtfilt, lfilter
 
 import telemetry_parser
 
@@ -66,6 +66,39 @@ class MEILensParams:
 
 
 @dataclass
+class ImuCalibration:
+    """
+    How normalized_imu() maps into the camera frame (see section 3).
+
+    imu_to_cam: proper rotation Q, applied to gyro and accel alike.
+    accel_sign: -1 when Q @ accel points up at rest (specific force), +1 when
+        it points down.
+    fuse_gyro: False when the gyro axes are unverified for this model. The
+        leveling then low-passes the accelerometer alone; rolling shutter
+        still uses the gyro.
+    """
+    imu_to_cam: np.ndarray
+    accel_sign: float
+    fuse_gyro: bool = True
+
+
+@dataclass
+class ImuOrientation:
+    """Camera motion and gravity at every IMU sample (see section 3)."""
+    ts: np.ndarray            # (n,) seconds from the first video frame
+    motion: Slerp             # C(t): world-fixed directions, camera(ts[0]) -> camera(t)
+    down: np.ndarray          # (n, 3) unit gravity direction in the camera frame
+
+    def motion_at(self, t):
+        return self.motion(np.clip(t, self.ts[0], self.ts[-1]))
+
+    def down_at(self, t):
+        d = np.stack([np.interp(t, self.ts, self.down[:, j]) for j in range(3)],
+                     axis=-1)
+        return d / np.linalg.norm(d, axis=-1, keepdims=True)
+
+
+@dataclass
 class PipelineMetadata:
     lens_params: list         # [MEILensParams front, MEILensParams back]
     imu_samples: list         # normalized_imu output
@@ -75,7 +108,7 @@ class PipelineMetadata:
     width: int
     height: int
     offset: list
-    imu_to_cam: object = None # 3x3, resolved from the camera model
+    imu_calib: ImuCalibration = None  # resolved from the camera model
 
 
 # ============================================================
@@ -341,12 +374,15 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         frame_count = int(meta.get('total_frames') or 0)
 
     camera_type = meta.get('camera_type', '')
-    imu_to_cam = IMU_TO_CAM_BY_CAMERA.get(camera_type)
-    if imu_to_cam is None:
-        print(f"  WARNING: no IMU_TO_CAM for {camera_type!r}, falling back to "
-              "the X5 matrix. Stabilization will be wrong; use --no-stab or "
+    imu_calib = IMU_CALIBRATION_BY_CAMERA.get(camera_type)
+    if imu_calib is None:
+        print(f"  WARNING: no IMU calibration for {camera_type!r}, falling back "
+              "to the X5 one. Stabilization will be wrong; use --no-stab or "
               "re-solve against a Studio render.")
-        imu_to_cam = IMU_TO_CAM
+        imu_calib = IMU_CALIBRATION_BY_CAMERA['Insta360 X5']
+    elif not imu_calib.fuse_gyro:
+        print(f"  WARNING: the {camera_type} gyro axes are unverified; leveling "
+              "uses the accelerometer alone.")
 
     return PipelineMetadata(
         lens_params=lenses,
@@ -354,211 +390,195 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         frame_count=frame_count,
         frame_readout_time=frame_readout_time,
         width=width, height=height, offset=offset,
-        imu_to_cam=imu_to_cam,
+        imu_calib=imu_calib,
     )
 
 
 # ============================================================
 # 3. IMU Stabilization
 # ============================================================
+#
+# One convention serves leveling and rolling shutter. The camera frame is
+# X right, Y down, Z forward, and the renderer samples the camera along
+# rays_cam = R @ rays_out, so every rotation here maps output directions into
+# the camera frame.
+#
+#   w_k      camera angular velocity, rad/s, right-handed: Q @ gyro_k
+#   C_k      camera motion since the first IMU sample: a world-fixed direction
+#            has camera coordinates v_k = C_k @ v_0, C_{k+1} = exp(-w_k dt_k) C_k
+#   down_k   gravity direction in the camera frame
+#   R_level  shortest arc taking +Y onto down, which levels the horizon
+#   R_row    C(t_row) C(t_frame)^T R_level(t_frame), for a scanline read at t_row
 
-# IMU-to-camera rotation for the X5.
+GRAVITY = 9.81
+
+# Half turn about Y.
+_FLIP_XZ = np.diag([-1.0, 1.0, -1.0])
+
+# IMU-to-camera rotation for the X5, as solved upstream.
 # Solved via Wahba's method from GT-aligned gravity vectors across two videos
-# on one specific X5 unit. Maps normalized_imu() output to the camera frame
-# (X=right, Y=down, Z=forward). The IMU sits at ~120 degrees from identity
+# on one specific X5 unit. The IMU sits at ~120 degrees from identity
 # on the PCB.
 #
 # Specific to one camera. Unit-to-unit PCB mounting variation will degrade
 # stabilization on other X5s. Use --no-stab, or re-solve against a Studio
 # render from your own hardware.
+#
+# It was fitted for a leveling that took IMU_TO_CAM @ accel onto +Y. That arc
+# is exactly the arc taking +Y onto _FLIP_XZ @ IMU_TO_CAM @ accel, which is what
+# the X5 calibration below uses, so X5 leveling directions are unchanged. Its
+# gyro axes were never checked against footage.
 IMU_TO_CAM = np.array([
     [-0.5678,  0.4608, -0.6821],
     [ 0.7642,  0.6031, -0.2287],
     [ 0.3060, -0.6511, -0.6946],
 ], dtype=np.float64)
 
-# PROVISIONAL. Fitted for the X6 the same way, against an 8K equirectangular
-# Insta360 Studio render used as ground truth: each frame of our own unlevelled
-# render is aligned to the Studio frame photometrically, the resulting rotation
-# gives the true up direction in camera frame, and Wahba is solved against the
-# smoothed accelerometer. Residuals were 2.0 deg median on the only clip
-# available so far, and that clip has the camera being handled rather than
-# ridden, so this needs re-solving on steady footage.
+# IMU-to-camera rotation for the X6. Each frame of our own unlevelled render is
+# aligned photometrically to an 8K equirectangular Insta360 Studio render,
+# which gives the true up direction in the camera frame. The rotation is first
+# solved so that the gyro, integrated over 0.17 s, carries each up direction
+# onto the next. Small rotations barely constrain its tilt, so it is then
+# turned by 6.5 deg to align the filtered gravity with the measured vertical
+# on a handheld clip. On a ridden clip left out of that fit, the horizon is
+# within 0.96 deg of Studio's (median; 1.73 deg q90), and the gyro predicts
+# rotations over 0.17 to 1 s within 0.2 deg (median).
 IMU_TO_CAM_X6 = np.array([
-    [ 0.099100,  0.142204,  0.984864],
-    [ 0.892420,  0.425125, -0.151182],
-    [-0.440189,  0.893894, -0.084776],
+    [ 0.018092,  0.009943,  0.999787],
+    [-0.013182,  0.999866, -0.009705],
+    [-0.999749, -0.013003,  0.018220],
 ], dtype=np.float64)
 
-IMU_TO_CAM_BY_CAMERA = {
-    'Insta360 X5': IMU_TO_CAM,
-    'Insta360 X6': IMU_TO_CAM_X6,
+IMU_CALIBRATION_BY_CAMERA = {
+    'Insta360 X5': ImuCalibration(_FLIP_XZ @ IMU_TO_CAM, accel_sign=1.0,
+                                  fuse_gyro=False),
+    'Insta360 X6': ImuCalibration(IMU_TO_CAM_X6, accel_sign=-1.0),
 }
 
 
-def imu_to_camera(vec, M=None):
-    """Transform a vector from IMU frame to camera image frame."""
-    return (IMU_TO_CAM if M is None else M) @ np.asarray(vec)
+def imu_arrays(imu_samples, calib):
+    """Timestamps (s), camera angular velocity (rad/s) and camera-frame accel."""
+    ts = np.array([s['timestamp_ms'] for s in imu_samples]) / 1000.0
+    Q = calib.imu_to_cam
+    gyro = np.deg2rad(np.array([s['gyro'] for s in imu_samples])) @ Q.T
+    accel = np.array([s['accl'] for s in imu_samples], dtype=np.float64) @ Q.T
+    return ts, gyro, accel
 
 
-def compute_gravity_orientation(accel_cam):
+def integrate_gyro(ts, gyro_cam):
     """
-    Compute orientation from gravity vector in camera Y-down frame.
-    Returns rotation that levels the horizon.
+    Integrate the camera angular velocity (rad/s) into C_k, the rotation taking
+    a world-fixed direction from camera coordinates at ts[0] to those at ts[k].
     """
-    g = accel_cam / np.linalg.norm(accel_cam)
-    target = np.array([0.0, 1.0, 0.0])  # gravity = +Y when level
+    steps = Rotation.from_rotvec(-gyro_cam[:-1] * np.diff(ts)[:, None]).as_quat()
+    x, y, z, w = 0.0, 0.0, 0.0, 1.0
+    quats = [(x, y, z, w)]
+    for bx, by, bz, bw in steps.tolist():
+        # C_{k+1} = step * C_k, as a Hamilton product
+        x, y, z, w = (bw * x + bx * w + by * z - bz * y,
+                      bw * y + by * w + bz * x - bx * z,
+                      bw * z + bz * w + bx * y - by * x,
+                      bw * w - bx * x - by * y - bz * z)
+        quats.append((x, y, z, w))
+    return Rotation.from_quat(quats)
 
-    axis = np.cross(g, target)
+
+def leveling_rotation(down_cam):
+    """
+    Rotation R with R @ [0, 1, 0] = down_cam: the shortest arc that levels the
+    output horizon when the camera sees gravity along down_cam.
+    """
+    d = np.asarray(down_cam, dtype=np.float64)
+    d = d / np.linalg.norm(d)
+    axis = np.array([d[2], 0.0, -d[0]])  # +Y x d
     s = np.linalg.norm(axis)
-    c = np.dot(g, target)
-
-    if s < 1e-6:
-        return Rotation.identity()
-
-    axis /= s
-    angle = np.arccos(np.clip(c, -1, 1))
-    return Rotation.from_rotvec(axis * angle)
+    if s < 1e-9:
+        # Upside down: any half turn about a horizontal axis levels it.
+        return (Rotation.identity() if d[1] > 0
+                else Rotation.from_rotvec([np.pi, 0.0, 0.0]))
+    return Rotation.from_rotvec(axis / s * np.arctan2(s, d[1]))
 
 
-def compute_stabilization_from_imu(
-    imu_samples, fps, tau=1.5, smoothing_sec=0.3, imu_to_cam=None
-):
+def _ema(x, alpha):
+    """Causal exponentially weighted sum of x along axis 0."""
+    return lfilter([alpha], [1.0, alpha - 1.0], x, axis=0)
+
+
+def compute_stabilization_from_imu(imu_samples, calib, tau=16.0,
+                                   accel_sigma=1.0, weight_floor=0.05,
+                                   lowpass_hz=3.0):
     """
-    Compute per-frame horizon-lock stabilization using complementary filter.
+    Estimate gravity in the camera frame with a complementary filter.
 
-    Fuses gyroscope (fast/drifty) with accelerometer (slow/noisy but drift-free).
-    Only applies accel correction when |accel| ≈ g (low dynamic acceleration).
+    The gyroscope carries the orientation over short time scales and the
+    accelerometer pulls it towards gravity with time constant tau (s). The pull
+    is weighted by exp(-((|a_lp| - g) / accel_sigma)^2), floored at
+    weight_floor, where a_lp is the accelerometer low-passed at lowpass_hz:
+    vibration and cornering count less, but never zero, because on a bike |a|
+    is rarely close to g.
 
-    Returns: dict mapping frame_index → Rotation (correction to apply)
-    """
-    if not imu_samples:
-        return {}
+    The filter runs offline and without lag: the accelerometer is expressed in
+    the gyro-integrated frame (C_k^T a_k), where gravity barely moves, summed
+    there with exponential weights forwards and backwards, then rotated back
+    to each sample. Near either end of the clip the pass that has seen more
+    data dominates the sum. A constant gyro bias tilts the two passes in
+    opposite directions, so it cancels to first order.
 
-    G = 9.81
-    ACCEL_THRESHOLD = 0.15  # Relative tolerance for |accel| ≈ g
-
-    n = len(imu_samples)
-    timestamps = np.array([s['timestamp_ms'] / 1000.0 for s in imu_samples])
-    accels_imu = np.array([[s['accl'][0], s['accl'][1], s['accl'][2]]
-                           for s in imu_samples])
-    gyros_imu = np.array([[s['gyro'][0], s['gyro'][1], s['gyro'][2]]
-                          for s in imu_samples])
-
-    # Convert to camera frame
-    M = IMU_TO_CAM if imu_to_cam is None else imu_to_cam
-    accels_cam = (M @ accels_imu.T).T
-    gyros_cam = (M @ gyros_imu.T).T
-
-    # Smooth accelerometer to filter out dynamic forces.
-    # A window of ~50 samples (~250ms at 200Hz) balances noise reduction
-    # vs responsiveness.
-    accel_mags = np.linalg.norm(accels_cam, axis=1)
-    smooth_window = min(50, n)
-    accels_smooth = np.zeros_like(accels_cam)
-    for j in range(3):
-        accels_smooth[:, j] = uniform_filter1d(accels_cam[:, j], smooth_window)
-
-    # Compute leveling rotation at each IMU sample
-    orientations = []
-    for i in range(n):
-        R_level = compute_gravity_orientation(accels_smooth[i])
-        orientations.append((timestamps[i], R_level))
-
-    # Map to per-frame corrections + per-scanline RS data
-    frame_corrections = {}
-    for frame_idx in range(int(timestamps[-1] * fps) + 2):
-        t_frame = frame_idx / fps
-        idx = np.searchsorted(timestamps, t_frame)
-        idx = np.clip(idx, 0, len(timestamps) - 1)
-        frame_corrections[frame_idx] = orientations[idx][1]
-
-    return frame_corrections
-
-
-def compute_rs_rotations(imu_samples, frame_num, fps, readout_time_ms,
-                         n_scanlines=32, apply_leveling=True,
-                         imu_to_cam=None):
-    """
-    Compute per-scanline orientation for rolling shutter correction.
-
-    During the readout, each row was captured at a different time.
-    The gyro angular velocity is integrated to compute the relative
-    orientation at each scanline position.
-
-    Because the returned rotation is TOTAL (gravity leveling composed with the
-    gyro delta), and because build_equirect_remap ignores its R_stabilization
-    argument whenever rs_rotations is supplied, this function alone decides
-    whether the output is levelled. Pass apply_leveling=False to keep the pure
-    rolling-shutter delta and leave the camera in its own frame -- without it
-    --no-stab has no effect at all.
-
-    Returns: list of (scanline_frac, Rotation) pairs, where the Rotation
-        is the TOTAL stabilization rotation at that scanline's capture time.
+    Returns: ImuOrientation, or None without IMU data.
     """
     if not imu_samples:
         return None
 
-    timestamps = np.array([s['timestamp_ms'] / 1000.0 for s in imu_samples])
-    gyros_imu = np.array([[s['gyro'][0], s['gyro'][1], s['gyro'][2]]
-                          for s in imu_samples])
-    accels_imu = np.array([[s['accl'][0], s['accl'][1], s['accl'][2]]
-                           for s in imu_samples])
+    ts, gyro, accel = imu_arrays(imu_samples, calib)
+    motion = integrate_gyro(ts, gyro)
+    gravity = calib.accel_sign * accel
+    if calib.fuse_gyro:
+        gravity = motion.inv().apply(gravity)
 
-    M = IMU_TO_CAM if imu_to_cam is None else imu_to_cam
-    gyros_cam = (M @ gyros_imu.T).T
-    accels_cam = (M @ accels_imu.T).T
+    rate = 1.0 / np.median(np.diff(ts))
+    b, a = butter(2, lowpass_hz / (rate / 2))
+    magnitude = np.linalg.norm(filtfilt(b, a, gravity, axis=0), axis=1)
+    weight = np.maximum(
+        weight_floor, np.exp(-((magnitude - GRAVITY) / accel_sigma) ** 2))
 
-    # Smoothed gravity for base orientation
-    smooth_window = min(50, len(imu_samples))
-    accels_smooth = np.zeros_like(accels_cam)
-    for j in range(3):
-        accels_smooth[:, j] = uniform_filter1d(accels_cam[:, j], smooth_window)
+    alpha = 1.0 / (tau * rate)
+    weighted = gravity * weight[:, None]
+    smooth = _ema(weighted, alpha) + _ema(weighted[::-1], alpha)[::-1]
+    if calib.fuse_gyro:
+        smooth = motion.apply(smooth)
+    down = smooth / np.linalg.norm(smooth, axis=1, keepdims=True)
+    return ImuOrientation(ts=ts, motion=Slerp(ts, motion), down=down)
 
-    readout_sec = readout_time_ms / 1000.0
+
+def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
+                         n_scanlines=32, apply_leveling=True):
+    """
+    Compute per-scanline orientation for rolling shutter correction.
+
+    Scanline fraction f is read at t_frame + (f - 0.5) * readout. Its rotation
+    is the camera motion since the frame centre, C(t_row) C(t_frame)^T,
+    composed with the frame's leveling rotation.
+
+    Because the returned rotation is TOTAL, and because build_equirect_remap
+    ignores its R_stabilization argument whenever rs_rotations is supplied,
+    this function alone decides whether the output is levelled. With
+    apply_leveling=False the camera stays in its own frame.
+
+    Returns: list of (scanline_frac, Rotation) pairs, or None without IMU data.
+    """
+    if orientation is None:
+        return None
+
     t_frame = frame_num / fps
-
-    # Base orientation at frame center
-    idx_center = np.searchsorted(timestamps, t_frame)
-    idx_center = np.clip(idx_center, 0, len(timestamps) - 1)
+    fracs = np.linspace(0.0, 1.0, n_scanlines)
+    t_rows = t_frame + (fracs - 0.5) * readout_time_ms / 1000.0
     if apply_leveling:
-        R_base = compute_gravity_orientation(accels_smooth[idx_center])
+        R_base = leveling_rotation(orientation.down_at(t_frame))
     else:
         R_base = Rotation.identity()
-
-    # For each scanline, compute the gyro-integrated orientation delta
-    # relative to the frame center
-    rs_rots = []
-    for i in range(n_scanlines):
-        scanline_frac = i / (n_scanlines - 1)
-        t_scanline = t_frame + (scanline_frac - 0.5) * readout_sec
-
-        # Integrate gyro from t_frame to t_scanline
-        idx_start = np.searchsorted(timestamps, min(t_frame, t_scanline))
-        idx_end = np.searchsorted(timestamps, max(t_frame, t_scanline))
-        idx_start = np.clip(idx_start, 0, len(timestamps) - 1)
-        idx_end = np.clip(idx_end, 0, len(timestamps) - 1)
-
-        if idx_start == idx_end:
-            R_delta = Rotation.identity()
-        else:
-            # Integrate gyro angular velocity
-            total_rotvec = np.zeros(3)
-            for k in range(min(idx_start, idx_end), max(idx_start, idx_end)):
-                dt = timestamps[k+1] - timestamps[k]
-                gyro_rad = np.deg2rad(gyros_cam[k])
-                total_rotvec += gyro_rad * dt
-
-            if t_scanline < t_frame:
-                total_rotvec = -total_rotvec
-
-            R_delta = Rotation.from_rotvec(total_rotvec)
-
-        # Total orientation at this scanline = base + gyro delta
-        R_scanline = R_delta * R_base
-        rs_rots.append((scanline_frac, R_scanline))
-
-    return rs_rots
+    R_rows = (orientation.motion_at(t_rows)
+              * orientation.motion_at(t_frame).inv() * R_base)
+    return [(float(f), R_rows[i]) for i, f in enumerate(fracs)]
 
 
 # ============================================================
@@ -1062,14 +1082,12 @@ class X5Pipeline:
         print(f"  Video: {self.meta.width}x{self.meta.height} @ "
               f"{self.meta.fps}fps, {self.meta.frame_count} frames")
 
-        print("[2/4] Computing IMU stabilization...")
-        if enable_stabilization:
-            self.stab_corrections = compute_stabilization_from_imu(
-                self.meta.imu_samples, self.meta.fps,
-                imu_to_cam=self.meta.imu_to_cam)
-            print(f"  {len(self.stab_corrections)} frame corrections computed")
-        else:
-            self.stab_corrections = {}
+        # Rolling shutter needs the gyro even when leveling is off.
+        print("[2/4] Computing IMU orientation...")
+        self.imu_orientation = compute_stabilization_from_imu(
+            self.meta.imu_samples, self.meta.imu_calib)
+        if self.imu_orientation is None:
+            print("  No IMU data: no stabilization, no rolling shutter correction")
 
         print("[3/4] Building remap tables...")
         self._build_maps(frame_idx=0)
@@ -1082,30 +1100,24 @@ class X5Pipeline:
 
     def _build_maps(self, frame_idx=0, depth_map=None):
         """Build remap tables with stabilization + rolling shutter correction."""
-        R_stab = self.stab_corrections.get(frame_idx, Rotation.identity())
-
-        # Per-scanline RS correction from gyro data. Note that rs_rots carries
-        # the gravity leveling too, and build_equirect_remap ignores R_stab
-        # whenever rs_rotations is not None -- so leveling is switched here.
+        # Per-scanline rotations carry the gravity leveling too, so leveling
+        # is switched here.
         rs_rots = compute_rs_rotations(
-            self.meta.imu_samples, frame_idx, self.meta.fps,
+            self.imu_orientation, frame_idx, self.meta.fps,
             self.meta.frame_readout_time, n_scanlines=32,
-            apply_leveling=self.enable_stabilization,
-            imu_to_cam=self.meta.imu_to_cam)
+            apply_leveling=self.enable_stabilization)
 
         self.maps = []
         for lens in self.meta.lens_params:
             mx, my, valid = build_equirect_remap(
-                lens, self.eq_w, self.eq_h,
-                R_stabilization=R_stab, rs_rotations=rs_rots,
+                lens, self.eq_w, self.eq_h, rs_rotations=rs_rots,
                 depth_map=depth_map)
             self.maps.append((mx, my, valid))
 
         self.w_front, self.w_back = compute_blend_weights(
             self.maps[0][2], self.maps[1][2], self.eq_w, self.eq_h)
 
-        # Store stab/RS params for depth-corrected rebuild
-        self._last_R_stab = R_stab
+        # Store RS params for depth-corrected rebuild
         self._last_rs_rots = rs_rots
 
     def _estimate_depth_and_rebuild(self, front_fish, back_fish):
@@ -1188,7 +1200,7 @@ class X5Pipeline:
         """
         t0 = time.time()
 
-        if self.stab_corrections:
+        if self.imu_orientation is not None:
             self._build_maps(frame_num)
 
         if frames is None:
