@@ -19,8 +19,8 @@ Everything fuses into one backward remap per output pixel (following the pattern
 
 1. Parse the `.insv` into two H.265 streams and an IMU track.
 2. Parse the `.pb` sidecar for MEI calibration (xi = 2.0, 13 distortion coefficients per lens, per-lens extrinsics).
-3. Derive per-frame stabilization from IMU gravity.
-4. Derive per-scanline rolling-shutter rotations, 32 SLERP keyframes across a 21 ms readout.
+3. Estimate gravity with a gyroscope and accelerometer complementary filter, for horizon-lock leveling.
+4. Derive per-scanline rolling-shutter rotations from the same gyro integration, 32 SLERP keyframes across the sensor readout.
 5. For each output pixel: ray, stabilize, transform into the lens frame, MEI-project, distort, sample.
 6. Blend on longitude preference times coverage depth. No hardcoded feather width.
 7. Symmetric per-channel gain across the seam.
@@ -63,7 +63,7 @@ MISC/Camera01/VID_xxx_00_001.insv.pb
 
 ## Limitations
 
-IMU calibration is camera-specific. The `IMU_TO_CAM` rotation in `x5_pipeline.py` was solved via Wahba's method against ground-truth gravity on one X5 unit. Unit-to-unit PCB mounting variation will degrade stabilization on other cameras. Pass `--no-stab`, or re-solve against a Studio render from your own hardware.
+IMU calibration is camera-specific. `IMU_CALIBRATION_BY_CAMERA` in `x5_pipeline.py` holds one calibration per model, each from a single unit. The X6 rotation was fitted on the gyroscope and on gravity against Studio renders. The X5 one was solved upstream via Wahba's method on the accelerometer alone; its gyro axes are unverified, so X5 leveling does not fuse the gyro. Unit-to-unit PCB mounting variation will degrade stabilization on other cameras. Pass `--no-stab`, or re-solve against a Studio render from your own hardware.
 
 Close-object parallax. Around 18 px of ghosting at the stitch line for objects under 3 m, a function of the 30 mm inter-lens baseline. DIS flow helps but does not match Insta360's learned `ai_stitch_model_v2.ins` on repetitive patterns like fence mesh or foliage.
 

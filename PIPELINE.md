@@ -44,9 +44,9 @@ Extracts calibration and telemetry from the `.insv` file and its `.pb` sidecar:
 
 - **Fallback**: Gyroflow lens profile from telemetry-parser (5 coefficients, shared distortion)
 
-- **IMU data**: `normalized_imu()` from telemetry-parser. Gyro (deg/s) and accel (m/s²) at ~200 Hz.
+- **IMU data**: `normalized_imu()` from telemetry-parser. Gyro (deg/s) and accel (m/s²) at ~1000 Hz (994 Hz measured on the X6).
 
-- **Video metadata**: frame rate, frame count, rolling shutter readout time (21.24ms)
+- **Video metadata**: frame rate, frame count, rolling shutter readout time (21.24 ms on the X5, 14.56 ms on the X6)
 
 **Resolution conversion**: Sensor coords (5376) → video coords (3840) via
 `fx_video = fx_sensor × 3840/5312` and `cx_video = cx_sensor × 3840/5376`
@@ -54,26 +54,48 @@ Extracts calibration and telemetry from the `.insv` file and its `.pb` sidecar:
 
 ### 2. IMU Stabilization (`compute_stabilization_from_imu`)
 
-Gravity-based horizon locking:
+Horizon lock from a complementary filter: the gyroscope carries the camera orientation
+over short time scales and the accelerometer pulls it slowly towards gravity. Roll and
+pitch are corrected; the heading follows the camera.
 
-1. Transform IMU accelerometer data to camera frame via `IMU_TO_CAM` matrix
-2. Smooth accelerometer over ~50 samples (~250ms) to filter dynamic forces
-3. Compute per-sample leveling rotation (Rodrigues rotation from gravity → [0,1,0])
-4. Map to per-frame corrections by nearest-timestamp lookup
+**Convention.** One convention serves leveling and rolling shutter. The camera frame is
+X right, Y down, Z forward, and the renderer samples `rays_cam = R @ rays_out`.
 
-**IMU_TO_CAM matrix**: Transforms `normalized_imu()` output to the camera image frame
-(X=right, Y=down, Z=forward). Currently derived via Wahba's method from GT-aligned
-gravity vectors. This is a known limitation. See "Known Limitations" below.
+- `ImuCalibration`, per camera model: a proper rotation `Q` applied to gyro and accel
+  alike, the accelerometer sign, and whether the gyro is fused.
+- `integrate_gyro`: `C_k`, the camera motion since the first sample,
+  `C_{k+1} = exp(-Q ω_k dt) C_k`.
+- `leveling_rotation`: the shortest arc taking +Y onto the gravity direction.
+
+**Filter**, run offline and without lag:
+
+1. Express the accelerometer in the gyro-integrated frame, `C_kᵀ (±Q a_k)`, where
+   gravity barely moves.
+2. Weight each sample by `exp(-((|a_lp| - g) / σ)²)`, floored at 0.05, with `a_lp`
+   low-passed at 3 Hz. On a bike |a| is rarely close to g, so samples are down-weighted,
+   never dropped.
+3. Sum with exponential weights (τ = 16 s) forwards and backwards, add the two passes,
+   normalize, and rotate back to each sample. A constant gyro bias tilts the two passes
+   in opposite directions and cancels to first order.
+
+**X6 results** against an Insta360 Studio render of a ridden clip (not used to fit the
+calibration; τ was chosen on it): the horizon is within 0.96° of Studio's (median;
+1.73° q90), and moves 0.67° between frames 0.17 s apart while Studio's own vertical
+moves 0.81°. The previous implementation smoothed the accelerometer alone over 50
+samples (50 ms at 994 Hz) and jumped 21° (median) on the same clip.
 
 ### 3. Rolling Shutter Correction (`compute_rs_rotations`)
 
-Per-scanline orientation from gyro integration:
+Per-scanline orientation from the same gyro integration:
 
-1. For each of 32 evenly-spaced scanline positions across the readout (21.24ms):
+1. For each of 32 evenly-spaced scanline positions across the readout:
    - Compute capture time: `t = t_frame + (scanline_frac - 0.5) × readout_time`
-   - Integrate gyro angular velocity from frame center to scanline time
-   - Compose with the base stabilization orientation
+   - Camera motion since the frame centre, `C(t) C(t_frame)ᵀ`, interpolated from the
+     integrated gyro
+   - Compose with the frame's leveling rotation (identity with `--no-stab`)
 2. The remap builder interpolates between these 32 orientations per output row via SLERP
+
+Maps are rebuilt every frame whenever the file has IMU data, including with `--no-stab`.
 
 **Impact**: Corrects ~12-18px of displacement during typical handheld motion (+0.65 dB).
 
@@ -193,9 +215,14 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 
 ## Known Limitations
 
-1. **IMU_TO_CAM calibration**: Currently derived via Wahba's method from GT-aligned
-   gravity vectors (2 videos). This is not fully principled. A self-calibrating AHRS
-   filter (Madgwick/Mahony) or video-based orientation estimation would be better.
+1. **IMU calibration**: `IMU_CALIBRATION_BY_CAMERA` holds one calibration per camera
+   model, each from a single unit.
+   - X6: rotation fitted on the gyroscope against Studio renders, then aligned on
+     gravity on a handheld clip, validated on a ridden clip.
+   - X5: the upstream matrix, fitted via Wahba's method on the accelerometer alone. Its
+     leveling directions are kept exactly, but its gyro axes were never checked, so its
+     leveling does not fuse the gyro, and its rolling shutter follows the X6 gyro sign
+     unverified.
 
 2. **Close-object parallax**: Objects <3m at the stitch line show ~18px ghosting from
    the 30mm inter-lens baseline. DIS optical flow partially corrects this but can't
@@ -205,8 +232,9 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 3. **Per-frame ffmpeg decode**: Each frame spawns a separate ffmpeg process (~2s overhead).
    Pipe-based batch decoding would improve video throughput.
 
-4. **Single-video IMU calibration**: The IMU_TO_CAM matrix was calibrated from video 003.
-   Videos with very different camera dynamics may have reduced stabilization accuracy.
+4. **Rolling shutter timing**: scanline time is indexed by the output equirectangular
+   row, not by the sensor row each ray lands on, and both lenses share it. Building one
+   SLERP per output row is also slow.
 
 ---
 
