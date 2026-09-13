@@ -477,11 +477,13 @@ IMU_TO_CAM_X6 = np.array([
 IMU_CALIBRATION_BY_CAMERA = {
     'Insta360 X5': ImuCalibration(_FLIP_XZ @ IMU_TO_CAM, accel_sign=1.0,
                                   fuse_gyro=False),
-    # X6 time offset: consecutive frames of our own unlevelled render, aligned
-    # to each other, match the gyro best 6, 6 and 4 ms early on three ridden
-    # segments.
+    # X6 time offset, with each pixel timed by its sensor row. On a bumpy ridden
+    # stretch, this single value steadies both a field seen near the top of
+    # the front sensor and a house near the bottom of the back one; 2 ms
+    # earlier or later is rougher on one of them. Aligning whole consecutive
+    # frames against the gyro, which mixes all rows, put it 4 to 6 ms earlier.
     'Insta360 X6': ImuCalibration(IMU_TO_CAM_X6, accel_sign=-1.0,
-                                  time_offset=-0.005),
+                                  time_offset=0.001),
 }
 
 
@@ -787,57 +789,8 @@ def mei_forward(X, Y, Z, xi, K, D_or_lens=None, lens=None):
 # 6. Equirectangular Remap Builder
 # ============================================================
 
-def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
-                         rs_rotations=None, depth_map=None):
-    """
-    Build remap tables: equirectangular pixels → fisheye source pixels.
-    Camera convention: X=right, Y=down, Z=forward.
-
-    Args:
-        rs_rotations: Optional list of (scanline_frac, Rotation) pairs for
-            rolling shutter correction.
-        depth_map: Optional H×W float array of scene depth (meters). When
-            provided, the lens translation (t_extrinsic) is used to compute
-            parallax-corrected projections. At d=∞ the result is identical
-            to the standard projection; at finite d, close objects shift
-            to their geometrically correct position for this specific lens.
-    """
-    uu, vv = np.meshgrid(
-        np.arange(eq_w, dtype=np.float64),
-        np.arange(eq_h, dtype=np.float64))
-
-    lon = (uu / eq_w) * 2 * np.pi - np.pi
-    lat = np.pi / 2 - (vv / eq_h) * np.pi
-
-    ray_x = np.cos(lat) * np.sin(lon)
-    ray_y = -np.sin(lat)   # Y-down camera convention
-    ray_z = np.cos(lat) * np.cos(lon)
-
-    if rs_rotations is not None and len(rs_rotations) > 1:
-        rays_stab = np.empty((eq_h, eq_w, 3), dtype=np.float64)
-        fracs = np.array([f for f, _ in rs_rotations])
-        rots = [R for _, R in rs_rotations]
-
-        for row in range(eq_h):
-            scanline_frac = row / eq_h
-            idx = np.searchsorted(fracs, scanline_frac) - 1
-            idx = np.clip(idx, 0, len(fracs) - 2)
-            f0, f1 = fracs[idx], fracs[idx + 1]
-            alpha = (scanline_frac - f0) / max(f1 - f0, 1e-9)
-            alpha = np.clip(alpha, 0, 1)
-
-            slerp = Slerp([0, 1], Rotation.concatenate([rots[idx], rots[idx + 1]]))
-            R_row = slerp([alpha])[0]
-
-            row_rays = np.stack([ray_x[row], ray_y[row], ray_z[row]], axis=-1)
-            rays_stab[row] = (R_row.as_matrix() @ row_rays.T).T
-
-        rays = rays_stab.reshape(-1, 3).T
-    else:
-        rays = np.stack([ray_x.ravel(), ray_y.ravel(), ray_z.ravel()], axis=0)
-        if R_stabilization is not None:
-            rays = R_stabilization.as_matrix() @ rays
-
+def _project_rays(lens, rays, eq_w, eq_h, depth_map=None):
+    """Camera-frame rays (3, eq_h * eq_w) to fisheye source pixels and validity."""
     # Transform ray directions to lens-local frame
     rays_lens = lens.R_extrinsic.T @ rays
 
@@ -874,6 +827,71 @@ def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
     dist_from_center = np.sqrt(
         (u_src - lens.cx) ** 2 + (v_src - lens.cy) ** 2)
     valid = valid & (dist_from_center < r_max)
+    return u_src, v_src, valid
+
+
+def _rotate_rays_at(rs_rotations, fracs, rays, chunk=1 << 20):
+    """
+    Rotate the rays (3, N) by the rotation at their readout fraction, a scalar
+    or one per ray. Neighbouring keyframes differ by well under a tenth of a
+    degree, so their matrices are interpolated linearly rather than slerped.
+    """
+    keys = np.array([f for f, _ in rs_rotations])
+    mats = Rotation.concatenate([R for _, R in rs_rotations]).as_matrix()
+    pos = np.interp(fracs, keys, np.arange(len(keys), dtype=np.float64))
+    idx = np.minimum(np.asarray(pos).astype(np.int64), len(keys) - 2)
+    alpha = pos - idx
+    if np.ndim(fracs) == 0:
+        return ((1.0 - alpha) * mats[idx] + alpha * mats[idx + 1]) @ rays
+    out = np.empty_like(rays)
+    for s in range(0, rays.shape[1], chunk):
+        i, a = idx[s:s + chunk], alpha[s:s + chunk, None, None]
+        M = (1.0 - a) * mats[i] + a * mats[i + 1]
+        out[:, s:s + chunk] = np.einsum('nij,jn->in', M, rays[:, s:s + chunk])
+    return out
+
+
+def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
+                         rs_rotations=None, depth_map=None):
+    """
+    Build remap tables: equirectangular pixels → fisheye source pixels.
+    Camera convention: X=right, Y=down, Z=forward.
+
+    Args:
+        rs_rotations: Optional list of (readout_frac, Rotation) pairs for
+            rolling shutter correction, readout_frac being the sensor row
+            over the image height.
+        depth_map: Optional H×W float array of scene depth (meters). When
+            provided, the lens translation (t_extrinsic) is used to compute
+            parallax-corrected projections. At d=∞ the result is identical
+            to the standard projection; at finite d, close objects shift
+            to their geometrically correct position for this specific lens.
+    """
+    uu, vv = np.meshgrid(
+        np.arange(eq_w, dtype=np.float64),
+        np.arange(eq_h, dtype=np.float64))
+
+    lon = (uu / eq_w) * 2 * np.pi - np.pi
+    lat = np.pi / 2 - (vv / eq_h) * np.pi
+
+    ray_x = np.cos(lat) * np.sin(lon)
+    ray_y = -np.sin(lat)   # Y-down camera convention
+    ray_z = np.cos(lat) * np.cos(lon)
+
+    rays = np.stack([ray_x.ravel(), ray_y.ravel(), ray_z.ravel()], axis=0)
+    if rs_rotations is not None and len(rs_rotations) > 1:
+        # Rolling shutter: a source pixel is exposed when its sensor row is
+        # read, and rows run down the stored fisheye image. Project once with
+        # the mid-readout rotation to find each pixel's row, then again with
+        # the rotation at that row's time.
+        _, v_mid, _ = _project_rays(
+            lens, _rotate_rays_at(rs_rotations, 0.5, rays), eq_w, eq_h, depth_map)
+        row = np.clip(np.nan_to_num(v_mid.ravel() / lens.height, nan=0.5), 0.0, 1.0)
+        rays = _rotate_rays_at(rs_rotations, row, rays)
+    elif R_stabilization is not None:
+        rays = R_stabilization.as_matrix() @ rays
+
+    u_src, v_src, valid = _project_rays(lens, rays, eq_w, eq_h, depth_map)
 
     map_x = np.where(valid, u_src, 0).astype(np.float32)
     map_y = np.where(valid, v_src, 0).astype(np.float32)

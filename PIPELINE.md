@@ -65,8 +65,8 @@ X right, Y down, Z forward, and the renderer samples `rays_cam = R @ rays_out`.
 
 - `ImuCalibration`, per camera model: a proper rotation `Q` applied to gyro and accel
   alike, the accelerometer sign, whether the gyro is fused, and the IMU time offset
-  (−5 ms on the X6, measured by aligning consecutive frames of our own render with the
-  gyro on three ridden segments).
+  (+1 ms on the X6: on a bumpy ridden stretch, the value that steadies both a field near
+  the top of the front sensor and a house near the bottom of the back one).
 - Frame times are `frame / fps` with the exact stream rate, and the frame reader passes
   frames through unchanged (`-fps_mode passthrough`): after a seek, ffmpeg would
   otherwise repeat the first frame and shift every later one by a frame against the IMU.
@@ -98,12 +98,19 @@ samples (50 ms at 994 Hz) and jumped 21° (median) on the same clip.
 
 Per-scanline orientation from the same gyro integration:
 
-1. For each of 32 evenly-spaced scanline positions across the readout:
-   - Compute capture time: `t = t_frame + (scanline_frac - 0.5) × readout_time`
+1. For each of 32 evenly-spaced readout positions:
+   - Compute capture time: `t = t_frame + (readout_frac - 0.5) × readout_time`
    - Camera motion since the frame centre, `C(t) C(t_frame)ᵀ`, interpolated from the
      integrated gyro
    - Compose with the frame's leveling rotation (identity with `--no-stab`)
-2. The remap builder interpolates between these 32 orientations per output row via SLERP
+2. Each output pixel is timed by the sensor row it samples. The remap builder projects
+   once with the mid-readout rotation to find that row (`v / height`: rows are read down
+   the stored fisheye image), then again with the rotation interpolated at that row.
+
+The readout direction was measured: a field near the top of the front sensor and a house
+near the bottom of the back one need readout times 8 ms apart to both stop shaking, as a
+top-to-bottom readout over 14.56 ms predicts (8.6 ms); across-the-row readout would
+predict none.
 
 Maps are rebuilt every frame whenever the file has IMU data, including with `--no-stab`.
 
@@ -228,8 +235,8 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 1. **IMU calibration**: `IMU_CALIBRATION_BY_CAMERA` holds one calibration per camera
    model, each from a single unit.
    - X6: rotation fitted on the gyroscope against Studio renders, then aligned on
-     gravity on a handheld clip, validated on a ridden clip; IMU time offset measured
-     on three ridden segments.
+     gravity on a handheld clip, validated on a ridden clip; IMU time offset tuned on a
+     bumpy ridden stretch.
    - X5: the upstream matrix, fitted via Wahba's method on the accelerometer alone. Its
      leveling directions are kept exactly, but its gyro axes were never checked, so its
      leveling does not fuse the gyro, and its rolling shutter follows the X6 gyro sign
@@ -243,9 +250,9 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 3. **Per-frame ffmpeg decode**: Each frame spawns a separate ffmpeg process (~2s overhead).
    Pipe-based batch decoding would improve video throughput.
 
-4. **Rolling shutter timing**: scanline time is indexed by the output equirectangular
-   row, not by the sensor row each ray lands on, and both lenses share it. Building one
-   SLERP per output row is also slow.
+4. **Rolling shutter timing**: rows are timed by their position on the sensor, but the
+   readout is assumed to start at the frame time minus half the readout, and the same
+   offset serves both sensors. It was tuned on one bumpy stretch of one clip.
 
 ---
 

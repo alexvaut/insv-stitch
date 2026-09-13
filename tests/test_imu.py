@@ -193,6 +193,20 @@ def test_heading_is_smoothed():
     assert ang(orientation.leveling_at(t).apply(Y), down).max() < 1e-6
 
 
+def test_sensor_row_remap_matches_single_rotation():
+    # With the same rotation at every row, the two-pass rolling shutter remap
+    # must reduce to a plain rotated projection.
+    lens = xp.MEILensParams(xi=1.0, fx=900.0, fy=900.0, cx=960.0, cy=960.0,
+                            width=1920, height=1920)
+    R = Rotation.from_euler('XYZ', [20, -35, 10], degrees=True)
+    rows = [(float(f), R) for f in np.linspace(0.0, 1.0, 32)]
+    by_row = xp.build_equirect_remap(lens, 128, 64, rs_rotations=rows)
+    fixed = xp.build_equirect_remap(lens, 128, 64, R_stabilization=R)
+    assert np.array_equal(by_row[2], fixed[2])
+    assert np.abs(by_row[0] - fixed[0]).max() < 1e-3
+    assert np.abs(by_row[1] - fixed[1]).max() < 1e-3
+
+
 def test_wrong_signs_are_caught():
     ts, B, down, samples = simulate()
     flipped_accel = xp.ImuCalibration(Q, accel_sign=1.0)
