@@ -46,7 +46,7 @@ Extracts calibration and telemetry from the `.insv` file and its `.pb` sidecar:
 
 - **IMU data**: `normalized_imu()` from telemetry-parser. Gyro (deg/s) and accel (m/s²) at ~1000 Hz (994 Hz measured on the X6).
 
-- **Video metadata**: frame rate, frame count, rolling shutter readout time (21.24 ms on the X5, 14.56 ms on the X6)
+- **Video metadata**: frame rate and frame count from the stream (`ffprobe`; the metadata rounds 29.97 fps to 30, which drifts frame times against the IMU by 33 ms every 1000 frames), rolling shutter readout time (21.24 ms on the X5, 14.56 ms on the X6)
 
 **Resolution conversion**: Sensor coords (5376) → video coords (3840) via
 `fx_video = fx_sensor × 3840/5312` and `cx_video = cx_sensor × 3840/5376`
@@ -56,13 +56,20 @@ Extracts calibration and telemetry from the `.insv` file and its `.pb` sidecar:
 
 Horizon lock from a complementary filter: the gyroscope carries the camera orientation
 over short time scales and the accelerometer pulls it slowly towards gravity. Roll and
-pitch are corrected; the heading follows the camera.
+pitch are corrected. Leveling alone passes the camera's rotation about the vertical
+straight through, which on a bike is mostly vibration, so the heading follows the
+camera's heading smoothed.
 
 **Convention.** One convention serves leveling and rolling shutter. The camera frame is
 X right, Y down, Z forward, and the renderer samples `rays_cam = R @ rays_out`.
 
 - `ImuCalibration`, per camera model: a proper rotation `Q` applied to gyro and accel
-  alike, the accelerometer sign, and whether the gyro is fused.
+  alike, the accelerometer sign, whether the gyro is fused, and the IMU time offset
+  (−5 ms on the X6, measured by aligning consecutive frames of our own render with the
+  gyro on three ridden segments).
+- Frame times are `frame / fps` with the exact stream rate, and the frame reader passes
+  frames through unchanged (`-fps_mode passthrough`): after a seek, ffmpeg would
+  otherwise repeat the first frame and shift every later one by a frame against the IMU.
 - `integrate_gyro`: `C_k`, the camera motion since the first sample,
   `C_{k+1} = exp(-Q ω_k dt) C_k`.
 - `leveling_rotation`: the shortest arc taking +Y onto the gravity direction.
@@ -77,6 +84,9 @@ X right, Y down, Z forward, and the renderer samples `rays_cam = R @ rays_out`.
 3. Sum with exponential weights (τ = 16 s) forwards and backwards, add the two passes,
    normalize, and rotate back to each sample. A constant gyro bias tilts the two passes
    in opposite directions and cancels to first order.
+4. Heading: measure the levelled output's heading in the gyro-integrated frame, smooth
+   it with a Gaussian (σ = 0.5 s), and turn each frame about gravity by the difference.
+   Turning about gravity leaves the horizon level.
 
 **X6 results** against an Insta360 Studio render of a ridden clip (not used to fit the
 calibration; τ was chosen on it): the horizon is within 0.96° of Studio's (median;
@@ -218,7 +228,8 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 1. **IMU calibration**: `IMU_CALIBRATION_BY_CAMERA` holds one calibration per camera
    model, each from a single unit.
    - X6: rotation fitted on the gyroscope against Studio renders, then aligned on
-     gravity on a handheld clip, validated on a ridden clip.
+     gravity on a handheld clip, validated on a ridden clip; IMU time offset measured
+     on three ridden segments.
    - X5: the upstream matrix, fitted via Wahba's method on the accelerometer alone. Its
      leveling directions are kept exactly, but its gyro axes were never checked, so its
      leveling does not fuse the gyro, and its rolling shutter follows the X6 gyro sign

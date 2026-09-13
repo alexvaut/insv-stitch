@@ -19,7 +19,7 @@ Everything fuses into one backward remap per output pixel (following the pattern
 
 1. Parse the `.insv` into two H.265 streams and an IMU track.
 2. Parse the `.pb` sidecar for MEI calibration (xi = 2.0, 13 distortion coefficients per lens, per-lens extrinsics).
-3. Estimate gravity with a gyroscope and accelerometer complementary filter, for horizon-lock leveling.
+3. Estimate gravity with a gyroscope and accelerometer complementary filter, for horizon-lock leveling with a smoothed heading.
 4. Derive per-scanline rolling-shutter rotations from the same gyro integration, 32 SLERP keyframes across the sensor readout.
 5. For each output pixel: ray, stabilize, transform into the lens frame, MEI-project, distort, sample.
 6. Blend on longitude preference times coverage depth. No hardcoded feather width.

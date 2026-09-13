@@ -14,8 +14,10 @@ import time
 import re
 import base64
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from scipy.spatial.transform import Rotation, Slerp
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import butter, filtfilt, lfilter
 
 import telemetry_parser
@@ -76,10 +78,13 @@ class ImuCalibration:
     fuse_gyro: False when the gyro axes are unverified for this model. The
         leveling then low-passes the accelerometer alone; rolling shutter
         still uses the gyro.
+    time_offset: seconds; the IMU sample stamped t + time_offset belongs to
+        the video frame at t.
     """
     imu_to_cam: np.ndarray
     accel_sign: float
     fuse_gyro: bool = True
+    time_offset: float = 0.0
 
 
 @dataclass
@@ -88,6 +93,7 @@ class ImuOrientation:
     ts: np.ndarray            # (n,) seconds from the first video frame
     motion: Slerp             # C(t): world-fixed directions, camera(ts[0]) -> camera(t)
     down: np.ndarray          # (n, 3) unit gravity direction in the camera frame
+    heading: np.ndarray       # (n,) turn about down (rad) smoothing the heading
 
     def motion_at(self, t):
         return self.motion(np.clip(t, self.ts[0], self.ts[-1]))
@@ -96,6 +102,12 @@ class ImuOrientation:
         d = np.stack([np.interp(t, self.ts, self.down[:, j]) for j in range(3)],
                      axis=-1)
         return d / np.linalg.norm(d, axis=-1, keepdims=True)
+
+    def leveling_at(self, t):
+        """Camera-from-output rotation: level horizon, smoothed heading."""
+        d = self.down_at(t)
+        turn = np.asarray(np.interp(t, self.ts, self.heading))[..., None]
+        return Rotation.from_rotvec(d * turn) * leveling_rotation(d)
 
 
 @dataclass
@@ -358,18 +370,29 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         print(f"  Using Gyroflow/offset_v3 calibration (5 coefficients)")
 
     imu_samples = tp.normalized_imu()
-    fps_val = float(meta.get('frame_rate', 30))
     # The X5 reports this under Lens.Data; the X6 only has Default.Metadata.
     frame_readout_time = lens_data.get('frame_readout_time')
     if frame_readout_time is None:
         frame_readout_time = float(meta.get('rolling_shutter_time') or 21.24)
 
     cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-           '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', insv_path]
+           '-show_entries', 'stream=nb_frames,r_frame_rate',
+           '-of', 'default=nw=1', insv_path]
+    stream = {}
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        frame_count = int(r.stdout.strip())
+        stream = dict(line.split('=', 1) for line in r.stdout.split())
     except Exception:
+        pass
+    # The metadata rounds 30000/1001 fps to 30, which would drift frame times
+    # against the IMU by 33 ms every 1000 frames; the stream rate is exact.
+    try:
+        fps_val = float(Fraction(stream['r_frame_rate']))
+    except (KeyError, ValueError, ZeroDivisionError):
+        fps_val = float(meta.get('frame_rate', 30))
+    try:
+        frame_count = int(stream['nb_frames'])
+    except (KeyError, ValueError):
         # HEVC streams often carry no nb_frames; the camera records the count.
         frame_count = int(meta.get('total_frames') or 0)
 
@@ -407,7 +430,9 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
 #   C_k      camera motion since the first IMU sample: a world-fixed direction
 #            has camera coordinates v_k = C_k @ v_0, C_{k+1} = exp(-w_k dt_k) C_k
 #   down_k   gravity direction in the camera frame
-#   R_level  shortest arc taking +Y onto down, which levels the horizon
+#   R_level  shortest arc taking +Y onto down, which levels the horizon, then
+#            turned about down so the output heading follows the camera's
+#            heading smoothed
 #   R_row    C(t_row) C(t_frame)^T R_level(t_frame), for a scanline read at t_row
 
 GRAVITY = 9.81
@@ -452,13 +477,18 @@ IMU_TO_CAM_X6 = np.array([
 IMU_CALIBRATION_BY_CAMERA = {
     'Insta360 X5': ImuCalibration(_FLIP_XZ @ IMU_TO_CAM, accel_sign=1.0,
                                   fuse_gyro=False),
-    'Insta360 X6': ImuCalibration(IMU_TO_CAM_X6, accel_sign=-1.0),
+    # X6 time offset: consecutive frames of our own unlevelled render, aligned
+    # to each other, match the gyro best 6, 6 and 4 ms early on three ridden
+    # segments.
+    'Insta360 X6': ImuCalibration(IMU_TO_CAM_X6, accel_sign=-1.0,
+                                  time_offset=-0.005),
 }
 
 
 def imu_arrays(imu_samples, calib):
-    """Timestamps (s), camera angular velocity (rad/s) and camera-frame accel."""
-    ts = np.array([s['timestamp_ms'] for s in imu_samples]) / 1000.0
+    """Video-time stamps (s), camera angular velocity (rad/s), camera-frame accel."""
+    ts = (np.array([s['timestamp_ms'] for s in imu_samples]) / 1000.0
+          - calib.time_offset)
     Q = calib.imu_to_cam
     gyro = np.deg2rad(np.array([s['gyro'] for s in imu_samples])) @ Q.T
     accel = np.array([s['accl'] for s in imu_samples], dtype=np.float64) @ Q.T
@@ -486,17 +516,15 @@ def integrate_gyro(ts, gyro_cam):
 def leveling_rotation(down_cam):
     """
     Rotation R with R @ [0, 1, 0] = down_cam: the shortest arc that levels the
-    output horizon when the camera sees gravity along down_cam.
+    output horizon when the camera sees gravity along down_cam, (3,) or (n, 3).
     """
     d = np.asarray(down_cam, dtype=np.float64)
-    d = d / np.linalg.norm(d)
-    axis = np.array([d[2], 0.0, -d[0]])  # +Y x d
-    s = np.linalg.norm(axis)
-    if s < 1e-9:
-        # Upside down: any half turn about a horizontal axis levels it.
-        return (Rotation.identity() if d[1] > 0
-                else Rotation.from_rotvec([np.pi, 0.0, 0.0]))
-    return Rotation.from_rotvec(axis / s * np.arctan2(s, d[1]))
+    d = d / np.linalg.norm(d, axis=-1, keepdims=True)
+    axis = np.stack([d[..., 2], np.zeros_like(d[..., 0]), -d[..., 0]], axis=-1)  # +Y x d
+    s = np.linalg.norm(axis, axis=-1, keepdims=True)
+    # Upside down, the arc is a half turn about any horizontal axis: take X.
+    unit = np.where(s > 1e-9, axis / np.maximum(s, 1e-300), [1.0, 0.0, 0.0])
+    return Rotation.from_rotvec(unit * np.arctan2(s, d[..., 1:2]))
 
 
 def _ema(x, alpha):
@@ -504,11 +532,27 @@ def _ema(x, alpha):
     return lfilter([alpha], [1.0, alpha - 1.0], x, axis=0)
 
 
+def _heading_correction(motion, down, sigma_samples):
+    """
+    Turn about gravity (rad), per sample, that makes the levelled output's
+    heading follow a Gaussian-smoothed version of the camera's.
+    """
+    forward = motion.inv().apply(leveling_rotation(down).apply([0.0, 0.0, 1.0]))
+    gravity = motion.inv().apply(down).mean(axis=0)
+    gravity /= np.linalg.norm(gravity)
+    e1 = np.cross(gravity, np.eye(3)[np.argmin(np.abs(gravity))])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(gravity, e1)
+    heading = np.unwrap(np.arctan2(forward @ e2, forward @ e1))
+    return gaussian_filter1d(heading, sigma_samples, mode='nearest') - heading
+
+
 def compute_stabilization_from_imu(imu_samples, calib, tau=16.0,
                                    accel_sigma=1.0, weight_floor=0.05,
-                                   lowpass_hz=3.0):
+                                   lowpass_hz=3.0, heading_sigma=0.5):
     """
-    Estimate gravity in the camera frame with a complementary filter.
+    Estimate gravity in the camera frame with a complementary filter, and a
+    smoothed heading.
 
     The gyroscope carries the orientation over short time scales and the
     accelerometer pulls it towards gravity with time constant tau (s). The pull
@@ -523,6 +567,11 @@ def compute_stabilization_from_imu(imu_samples, calib, tau=16.0,
     to each sample. Near either end of the clip the pass that has seen more
     data dominates the sum. A constant gyro bias tilts the two passes in
     opposite directions, so it cancels to first order.
+
+    Leveling leaves the camera's rotation about the vertical, which on a bike
+    is mostly vibration. The output heading therefore follows the camera's
+    through a Gaussian of heading_sigma seconds; 0 keeps it on the camera.
+    Without gyro fusion it always stays on the camera.
 
     Returns: ImuOrientation, or None without IMU data.
     """
@@ -547,7 +596,12 @@ def compute_stabilization_from_imu(imu_samples, calib, tau=16.0,
     if calib.fuse_gyro:
         smooth = motion.apply(smooth)
     down = smooth / np.linalg.norm(smooth, axis=1, keepdims=True)
-    return ImuOrientation(ts=ts, motion=Slerp(ts, motion), down=down)
+    if calib.fuse_gyro and heading_sigma:
+        heading = _heading_correction(motion, down, heading_sigma * rate)
+    else:
+        heading = np.zeros(len(ts))
+    return ImuOrientation(ts=ts, motion=Slerp(ts, motion), down=down,
+                          heading=heading)
 
 
 def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
@@ -557,7 +611,8 @@ def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
 
     Scanline fraction f is read at t_frame + (f - 0.5) * readout. Its rotation
     is the camera motion since the frame centre, C(t_row) C(t_frame)^T,
-    composed with the frame's leveling rotation.
+    composed with the frame's leveling rotation (level horizon, smoothed
+    heading).
 
     Because the returned rotation is TOTAL, and because build_equirect_remap
     ignores its R_stabilization argument whenever rs_rotations is supplied,
@@ -573,7 +628,7 @@ def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
     fracs = np.linspace(0.0, 1.0, n_scanlines)
     t_rows = t_frame + (fracs - 0.5) * readout_time_ms / 1000.0
     if apply_leveling:
-        R_base = leveling_rotation(orientation.down_at(t_frame))
+        R_base = orientation.leveling_at(t_frame)
     else:
         R_base = Rotation.identity()
     R_rows = (orientation.motion_at(t_rows)
@@ -628,8 +683,13 @@ class InsvFrameReader:
             if start_frame > 0:
                 # Output-side seek: ffmpeg decodes and discards internally,
                 # which is frame-accurate and avoids piping skipped frames.
-                cmd += ['-ss', f'{start_frame / float(fps):.6f}']
-            cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
+                # Half a frame early, so rounding never lands on a neighbour.
+                cmd += ['-ss', f'{(start_frame - 0.5) / float(fps):.6f}']
+            # Never duplicate or drop frames to keep a constant rate: after a
+            # seek between two frames, ffmpeg would otherwise repeat the first
+            # one and shift every later frame by a whole frame against the IMU.
+            cmd += ['-fps_mode', 'passthrough',
+                    '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
             self.procs.append(subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 bufsize=0))

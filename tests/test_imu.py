@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from scipy.spatial.transform import Rotation, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,7 +35,7 @@ def ang(u, v):
 
 
 # Largest gyro bias perpendicular to gravity measured on X6 footage.
-def simulate(gyro_bias_dps=0.2, seed=0):
+def simulate(gyro_bias_dps=0.2, seed=0, yaw_shake_deg=0.0):
     """Times, camera-from-world rotations B, true down, normalized_imu samples."""
     rng = np.random.default_rng(seed)
     ts = np.arange(30000) / RATE - 0.5
@@ -44,7 +45,10 @@ def simulate(gyro_bias_dps=0.2, seed=0):
         np.radians(20) * np.sin(2 * np.pi * 0.37 * ts + 1.0),
         np.radians(90) * np.sin(2 * np.pi * 0.05 * ts),
     ], axis=-1)
-    B = Rotation.from_euler('ZXY', euler) * Rotation.from_euler('X', 40, degrees=True)
+    # Optional 6 Hz shake about the world vertical, the part leveling leaves.
+    shake = np.outer(np.radians(yaw_shake_deg) * np.sin(2 * np.pi * 6.0 * ts), WORLD_DOWN)
+    B = (Rotation.from_euler('ZXY', euler) * Rotation.from_euler('X', 40, degrees=True)
+         * Rotation.from_rotvec(shake))
     down = B.apply(WORLD_DOWN)
 
     # Exact discrete gyro for the integrator: B_{k+1} B_k^T = exp(-w_k dt).
@@ -76,9 +80,9 @@ def filter_error(samples, down, calib=CALIB):
     return ang(orientation.down, down)
 
 
-def rs_error(samples, ts, B):
+def rs_error(samples, ts, B, calib=CALIB):
     """Max angle (deg) between rolling-shutter rotations and the true motion."""
-    orientation = xp.compute_stabilization_from_imu(samples, CALIB)
+    orientation = xp.compute_stabilization_from_imu(samples, calib)
     truth = Slerp(ts, B)
     worst = 0.0
     for frame in (30, 300, 600):
@@ -136,6 +140,22 @@ def test_rolling_shutter_follows_camera():
     assert rs_error(samples, ts, B) < 0.01
 
 
+def test_time_offset_realigns_imu_clock():
+    ts, B, down, samples = simulate(gyro_bias_dps=0.0)
+    late = [dict(s, timestamp_ms=s['timestamp_ms'] + 6.0) for s in samples]
+    realigned = xp.ImuCalibration(Q, accel_sign=-1.0, time_offset=0.006)
+    assert rs_error(late, ts, B, realigned) < 0.01
+    # Rolling shutter is relative to the frame centre, so the offset shows in
+    # the gravity estimate: 6 ms late reads where the camera was 6 ms earlier.
+    inner = slice(1000, -1000)
+
+    def tilt(calib):
+        orientation = xp.compute_stabilization_from_imu(late, calib)
+        return np.median(ang(orientation.down_at(ts[inner]), down[inner]))
+
+    assert tilt(realigned) < 0.2 and tilt(CALIB) > 0.25
+
+
 def test_rolling_shutter_keeps_level():
     # Each row's output +Y follows the frame's estimated gravity through the
     # camera motion since the frame centre (filter accuracy is tested above).
@@ -149,6 +169,28 @@ def test_rolling_shutter_keeps_level():
             t_row = t_frame + (frac - 0.5) * READOUT_MS / 1000.0
             expected = (truth(t_row) * truth(t_frame).inv()).apply(down_frame)
             assert ang(R.apply(Y), expected) < 0.05
+
+
+def test_heading_is_smoothed():
+    ts, B, _, samples = simulate(yaw_shake_deg=2.0)
+    orientation = xp.compute_stabilization_from_imu(samples, CALIB)
+    truth = Slerp(ts, B)
+    t = np.arange(60, 800) / FPS
+
+    def heading(R):
+        # Output forward axis in the world, whose down is +Y.
+        f = (truth(t).inv() * R).apply([0.0, 0.0, 1.0])
+        return np.unwrap(np.arctan2(f[:, 0], f[:, 2]))
+
+    def shake(h):
+        return np.std(h - uniform_filter1d(h, 15))
+
+    smoothed = heading(orientation.leveling_at(t))
+    level_only = heading(xp.leveling_rotation(orientation.down_at(t)))
+    assert shake(smoothed) < 0.2 * shake(level_only), (shake(smoothed), shake(level_only))
+    # Turning about gravity keeps the horizon level.
+    down = orientation.down_at(t)
+    assert ang(orientation.leveling_at(t).apply(Y), down).max() < 1e-6
 
 
 def test_wrong_signs_are_caught():
