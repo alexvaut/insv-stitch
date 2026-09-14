@@ -82,9 +82,9 @@ def _thread_pool():
 
 
 @cache
-def _side_thread():
-    """A thread for work running alongside a stitch; it may use the thread pool."""
-    return ThreadPoolExecutor(1)
+def _side_thread(role):
+    """A thread for one role of work running alongside a stitch; it may use the thread pool."""
+    return ThreadPoolExecutor(1, thread_name_prefix=role)
 
 
 def parallel_map(fn, *iterables):
@@ -1872,25 +1872,39 @@ class X5Pipeline:
         either side without a step. The arrays live on the CPU or the GPU;
         DIS flow itself runs on the CPU.
         """
+        fc, bc, flow = self._band_flow(fc, bc, valid_f, valid_b)
+        return self._warp_band(fc, bc, flow.result(), valid_f, valid_b, alpha)
+
+    def _band_flow(self, fc, bc, valid_f, valid_b):
+        """
+        _align_band's first half: both lenses of the band, each filled with
+        the other where invalid, and the future of their DIS flow, computed on
+        a CPU thread of its own.
+        """
         xp = array_module(fc)
         # Fill invalid pixels with the other lens's data before flow
         # so DIS doesn't try to match black regions to content.
         fc = xp.where(valid_f[:, :, np.newaxis], fc, bc)
         bc = xp.where(valid_b[:, :, np.newaxis], bc, fc)
-
-        # Flow is estimated with the seam frame scaled to flow_width.
         fg = cv2.cvtColor(to_numpy(fc), cv2.COLOR_BGR2GRAY)
         bg = cv2.cvtColor(to_numpy(bc), cv2.COLOR_BGR2GRAY)
+        return fc, bc, _side_thread('flow').submit(self._flow, fg, bg)
+
+    def _flow(self, fg, bg):
+        """DIS flow between two grey bands, front(x) ~ back(x + flow)."""
+        # Flow is estimated with the seam frame scaled to flow_width.
         scale = self.flow_width / self.st_w
         if scale < 1.0:
             size = (round(fg.shape[1] * scale), round(fg.shape[0] * scale))
             flow = self.flow_engine.compute(
                 cv2.resize(fg, size, interpolation=cv2.INTER_AREA),
                 cv2.resize(bg, size, interpolation=cv2.INTER_AREA))
-            flow = cv2.resize(flow, (fg.shape[1], fg.shape[0])) / scale
-        else:
-            flow = self.flow_engine.compute(fg, bg)
+            return cv2.resize(flow, (fg.shape[1], fg.shape[0])) / scale
+        return self.flow_engine.compute(fg, bg)
 
+    def _warp_band(self, fc, bc, flow, valid_f, valid_b, alpha):
+        """_align_band's second half, given the filled lenses and their flow."""
+        xp = array_module(fc)
         # Clamp flow magnitude to physical limit: the ~30 mm lens baseline
         # seen from 25 cm spans about 8 deg
         flow = xp.asarray(flow)
@@ -1921,14 +1935,24 @@ class X5Pipeline:
         InsvFrameReader; otherwise one is opened for this frame alone.
         Returns a numpy image, whichever device stitched it.
         """
+        return self._begin_frame(frame_num, frames)()
+
+    def _begin_frame(self, frame_num, frames):
+        """
+        stitch_frame up to the parallax flow, which is left computing on a CPU
+        thread; returns the function that finishes the frame. The next frame
+        may begin before it is called: the GPU then stitches that frame while
+        the CPU computes this one's flow.
+        """
         t0 = time.time()
         xp = self.xp
 
         # The output rotation's tables are computed on the CPU (see
         # equirect_rotation_maps) while the frame is stitched.
         R_out = self._seam_from_output(frame_num)
-        out_maps = _side_thread().submit(equirect_rotation_maps, R_out, self.st_w,
-                                         self.st_h, self.eq_w, self.eq_h, self.out_rays)
+        out_maps = _side_thread('rotation').submit(
+            equirect_rotation_maps, R_out, self.st_w, self.st_h,
+            self.eq_w, self.eq_h, self.out_rays)
 
         if self.imu_orientation is not None:
             self._build_maps(frame_num)
@@ -1991,6 +2015,7 @@ class X5Pipeline:
                 eq_back[seam].astype(xp.float32) * w_back,
                 0, 255).astype(xp.uint8)
 
+        flow = None
         if self.enable_flow and rows is not None:
             # Parallax correction in a band around the seam, the seam frame's
             # equator. The band is laid on its side so the seam runs down its
@@ -2006,25 +2031,31 @@ class X5Pipeline:
             # The aligned lenses are blended with the canvas weights, so the
             # band matches the canvas wherever one lens alone is valid.
             alpha = band(self.w_back[flow_rows])
-            fw, bw = self._align_band(
-                *(band(image[flow_rows]) for image in (eq_front, eq_back, valid_f, valid_b)),
-                alpha)
-            alpha = alpha[:, :, np.newaxis]
-            blended = fw * (1.0 - alpha) + bw * alpha
-            result[flow_rows] = xp.clip(xp.swapaxes(blended, 0, 1)[:, hw:-hw],
-                                        0, 255).astype(xp.uint8)
+            valid_band = [band(v[flow_rows]) for v in (valid_f, valid_b)]
+            fc, bc, flow = self._band_flow(band(eq_front[flow_rows]),
+                                           band(eq_back[flow_rows]), *valid_band)
 
-        # Turn the stitch from the seam frame to the output
-        result = to_numpy(rotate_equirect(result, R_out, self.eq_w, self.eq_h,
-                                          maps=out_maps.result()))
+        def finish():
+            if flow is not None:
+                fw, bw = self._warp_band(fc, bc, flow.result(), *valid_band, alpha)
+                a = alpha[:, :, np.newaxis]
+                blended = fw * (1.0 - a) + bw * a
+                result[flow_rows] = xp.clip(xp.swapaxes(blended, 0, 1)[:, hw:-hw],
+                                            0, 255).astype(xp.uint8)
 
-        # Optional edge-preserving denoise (bilateral filter)
-        if self.denoise:
-            result = cv2.bilateralFilter(result, 9, 40, 40)
+            # Turn the stitch from the seam frame to the output
+            out = to_numpy(rotate_equirect(result, R_out, self.eq_w, self.eq_h,
+                                           maps=out_maps.result()))
 
-        dt = time.time() - t0
-        print(f"Frame {frame_num}: {dt:.2f}s")
-        return result
+            # Optional edge-preserving denoise (bilateral filter)
+            if self.denoise:
+                out = cv2.bilateralFilter(out, 9, 40, 40)
+
+            dt = time.time() - t0
+            print(f"Frame {frame_num}: {dt:.2f}s")
+            return out
+
+        return finish
 
     def stitch_frame_to_file(self, frame_num, output_path):
         result = self.stitch_frame(frame_num)
@@ -2032,11 +2063,32 @@ class X5Pipeline:
         print(f"Saved: {output_path}")
         return result
 
+    def stitch_frames(self, start, end):
+        """
+        Yield the stitched frames start to end - 1 (fewer if the stream ends),
+        decoded ahead on a thread; each frame begins while the previous one's
+        parallax flow is computed.
+        """
+        reader = InsvFrameReader(self.insv_path, self.meta.width,
+                                 self.meta.height, self.meta.fps, start)
+        finish = None
+        try:
+            for n, pair in enumerate(read_ahead(reader.read, end - start), start):
+                begun = self._begin_frame(n, pair)
+                if finish is not None:
+                    yield finish()
+                finish = begun
+            if finish is not None:
+                yield finish()
+        finally:
+            reader.close()
+
     def stitch_video(self, output_path, start=0, end=-1):
         """
         Process frames to video using ffmpeg pipe for output. Decoding and
         encoding run ahead and behind on their own threads, so the stitch
-        waits for neither.
+        waits for neither, and each frame begins while the previous one's
+        parallax flow is computed.
         """
         if end == -1:
             end = self.meta.frame_count
@@ -2055,16 +2107,13 @@ class X5Pipeline:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
         t_total = time.time()
-        reader = InsvFrameReader(self.insv_path, self.meta.width,
-                                 self.meta.height, self.meta.fps, start)
         writer = BackgroundWriter(lambda image: proc.stdin.write(image.tobytes()))
         n = start
         try:
-            for pair in read_ahead(reader.read, end - start):
-                writer.put(self.stitch_frame(n, frames=pair))
+            for image in self.stitch_frames(start, end):
+                writer.put(image)
                 n += 1
         finally:
-            reader.close()
             writer.close()
             proc.stdin.close()
             proc.wait()
