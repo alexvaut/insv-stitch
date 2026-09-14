@@ -160,14 +160,14 @@ def test_gpu_projection_matches_numpy_exactly():
 
 
 @needs_gpu
-def test_gpu_remap_tables_match_cpu():
+def test_gpu_remap_tables_match_cpu_exactly():
     w, h = 512, 256
-    ref = xp.build_equirect_remap(LENS, w, h, rs_rotations=RS_ROTATIONS)
-    got = xp.build_equirect_remap(LENS, w, h, rs_rotations=RS_ROTATIONS,
-                                  rays=xp.equirect_rays(w, h, xp.cupy))
-    assert np.array_equal(got[2].get(), ref[2])
-    assert np.abs(got[0].get() - ref[0]).max() < 1e-3
-    assert np.abs(got[1].get() - ref[1]).max() < 1e-3
+    rays = xp.equirect_rays(w, h)
+    for kw in (dict(rs_rotations=RS_ROTATIONS), dict(R_stabilization=RS_ROTATIONS[5][1])):
+        ref = xp.build_equirect_remap(LENS, w, h, rays=rays, **kw)
+        got = xp.build_equirect_remap(LENS, w, h, rays=xp.cupy.asarray(rays), **kw)
+        for r, g in zip(ref, got):
+            assert np.array_equal(g.get(), r), kw.keys()
 
 
 @needs_gpu

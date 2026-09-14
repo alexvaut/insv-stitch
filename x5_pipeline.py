@@ -95,12 +95,13 @@ def parallel_map(fn, *iterables):
 def fused(*, tables=()):
     """
     Decorator for fn(xp, *args), made of elementwise arithmetic and
-    comparisons, xp.sqrt, xp.maximum and xp.where on its array and number
-    arguments, and xp.take from the 1D arrays it names in tables: called as
-    plain numpy on numpy arrays, and on CuPy arrays as one CUDA kernel traced
-    from the same code. The kernel keeps numpy's order of operations and
-    fuses no multiply-adds, so it matches numpy bit for bit (cupy.fuse
-    contracts them, which moves a distorted pixel by a float32 step).
+    comparisons, xp.sqrt, xp.maximum, xp.where and xp.matvec on its array and
+    number arguments (or tuples of them), and xp.take from the 1D arrays it
+    names in tables: called as plain numpy on numpy arrays, and on CuPy arrays
+    as one CUDA kernel traced from the same code. The kernel keeps numpy's
+    order of operations and fuses no multiply-adds but those numpy's matrix
+    product fuses, so it matches numpy bit for bit (cupy.fuse contracts them
+    all, which moves a distorted pixel by a float32 step).
     """
     def wrap(fn):
         names = list(inspect.signature(fn).parameters)[1:]
@@ -110,14 +111,37 @@ def fused(*, tables=()):
         @functools.wraps(fn)
         def run(*args):
             if array_module(args[0]) is np:
-                return fn(np, *args)
-            key = tuple(a.dtype.name if isinstance(a, cupy.ndarray)
-                        else 'int64' if isinstance(a, int) else 'float64' for a in args)
+                return fn(_NUMPY_OPS, *args)
+            leaves, shape = _flatten(args)
+            is_table = [i in table_positions
+                        for i, a in enumerate(args) for _ in _flatten((a,))[0]]
+            key = (shape, tuple(a.dtype.name if isinstance(a, cupy.ndarray)
+                                else 'int64' if isinstance(a, int) else 'float64'
+                                for a in leaves))
             if key not in kernels:
-                kernels[key] = _Trace(fn, key, table_positions).kernel()
-            return kernels[key](*args)
+                kernels[key] = _Trace(fn, shape, key[1], is_table).kernel()
+            return kernels[key](*leaves)
         return run
     return wrap
+
+
+def _flatten(args):
+    """Leaves of nested tuples, and the nesting (None for a leaf)."""
+    leaves, shape = [], []
+    for a in args:
+        if isinstance(a, tuple):
+            sub_leaves, sub_shape = _flatten(a)
+            leaves += sub_leaves
+            shape.append(sub_shape)
+        else:
+            leaves.append(a)
+            shape.append(None)
+    return leaves, tuple(shape)
+
+
+def _unflatten(shape, leaves):
+    """Inverse of _flatten, leaves being an iterator."""
+    return tuple(next(leaves) if s is None else _unflatten(s, leaves) for s in shape)
 
 
 class _Trace:
@@ -126,8 +150,9 @@ class _Trace:
     _CTYPES = {'float64': 'double', 'float32': 'float', 'int64': 'long long',
                'bool': 'bool'}
 
-    def __init__(self, fn, dtypes, table_positions):
-        self.fn, self.dtypes, self.tables, self.lines = fn, dtypes, table_positions, []
+    def __init__(self, fn, shape, dtypes, is_table):
+        self.fn, self.shape, self.dtypes, self.is_table = fn, shape, dtypes, is_table
+        self.lines = []
 
     def emit(self, ctype, expr):
         name = f't{len(self.lines)}'
@@ -147,13 +172,20 @@ class _Trace:
     def take(self, table, index):
         return self.emit(table.ctype, f'{table.name}[{_Traced.c(index)}]')
 
+    def matvec(self, m, X, Y, Z):
+        """_NumpyOps.matvec as OpenBLAS computes it: multiply-adds fused along each row."""
+        c = _Traced.c
+        return tuple(self.emit('double', f'fma({c(m[3 * i + 2])}, {c(Z)}, '
+                                         f'fma({c(m[3 * i + 1])}, {c(Y)}, {c(m[3 * i])} * {c(X)}))')
+                     for i in range(3))
+
     def kernel(self):
-        args = [_Traced(self, f'a{i}', self._CTYPES[d]) for i, d in enumerate(self.dtypes)]
-        outs = self.fn(self, *args)
+        leaves = [_Traced(self, f'a{i}', self._CTYPES[d]) for i, d in enumerate(self.dtypes)]
+        outs = self.fn(self, *_unflatten(self.shape, iter(leaves)))
         outs = outs if isinstance(outs, tuple) else (outs,)
         dtype_of = {c: d for d, c in self._CTYPES.items()}
         return cupy.ElementwiseKernel(
-            ', '.join(f'{"raw " if i in self.tables else ""}{d} a{i}'
+            ', '.join(f'{"raw " if self.is_table[i] else ""}{d} a{i}'
                       for i, d in enumerate(self.dtypes)),
             ', '.join(f'{dtype_of[o.ctype]} o{j}' for j, o in enumerate(outs)),
             '\n'.join(self.lines + [f'o{j} = {o.name};' for j, o in enumerate(outs)]),
@@ -198,6 +230,23 @@ class _Traced:
     __or__ = lambda s, o: s._binary(o, '||', ctype='bool')
     __neg__ = lambda s: s.trace.emit(s.ctype, f'-{s.name}')
     __invert__ = lambda s: s.trace.emit('bool', f'!{s.name}')
+
+
+class _NumpyOps:
+    """numpy, as fused functions see it on the CPU, with matvec."""
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+    @staticmethod
+    def matvec(m, X, Y, Z):
+        """The 3x3 matrix whose rows are m's 9 values, times the vectors (X, Y, Z)."""
+        out = np.asarray(m, dtype=np.float64).reshape(3, 3) @ np.stack(
+            (X.ravel(), Y.ravel(), Z.ravel()))
+        return tuple(c.reshape(X.shape) for c in out)
+
+
+_NUMPY_OPS = _NumpyOps()
 
 
 def _launch(kernel, n, *args):
@@ -1296,11 +1345,15 @@ _mei_projection = fused()(_mei)
 
 
 @fused()
-def _lens_pixels(xp, X, Y, Z, width, height, cos_max, *coefficients):
+def _lens_pixels(xp, X, Y, Z, rotations, width, height, cos_max, coefficients):
     """
-    Fisheye pixels of lens-frame rays, valid when projected inside the sensor
-    and closer to the optical axis than the angle whose cosine is cos_max.
+    Fisheye pixels of rays turned into the lens frame by each 3x3 matrix of
+    rotations in turn (9 values each), valid when projected inside the sensor
+    and closer to the optical axis than the angle whose cosine is cos_max;
+    coefficients as mei_coefficients gives them.
     """
+    for m in rotations:
+        X, Y, Z = xp.matvec(m, X, Y, Z)
     u, v, valid = _mei(xp, X, Y, Z, *coefficients)
     valid = valid & (u >= 0) & (u < width - 1)
     valid = valid & (v >= 0) & (v < height - 1)
@@ -1411,20 +1464,19 @@ def lens_max_angle(lens, samples=721):
     return min(fold, np.radians(lens.fov_deg) / 2.0)
 
 
-def _project_rays(lens, rays, eq_w, eq_h, depth_map=None, max_angle=None):
+def _project_rays(lens, rays, eq_w, eq_h, depth_map=None, max_angle=None,
+                  rotations=()):
     """
-    Camera-frame rays (3, eq_h * eq_w) to fisheye source pixels and validity;
-    max_angle is lens_max_angle(lens), when already at hand.
+    Camera-frame rays (3, eq_h * eq_w), first turned by each 3x3 matrix of
+    rotations in turn, to fisheye source pixels and validity; max_angle is
+    lens_max_angle(lens), when already at hand.
     """
     xp = array_module(rays)
     if max_angle is None:
         max_angle = lens_max_angle(lens)
     # Transform ray directions to lens-local frame
-    rays_lens = xp.asarray(lens.R_extrinsic.T) @ rays
-
-    Xl = rays_lens[0].reshape(eq_h, eq_w)
-    Yl = rays_lens[1].reshape(eq_h, eq_w)
-    Zl = rays_lens[2].reshape(eq_h, eq_w)
+    rotations = [*rotations, lens.R_extrinsic.T]
+    Xl, Yl, Zl = (c.reshape(eq_h, eq_w) for c in rays)
 
     # Translation-aware projection: account for lens offset from camera center.
     # For a 3D point at distance d along the ray:
@@ -1437,18 +1489,22 @@ def _project_rays(lens, rays, eq_w, eq_h, depth_map=None, max_angle=None):
         # The protobuf t_extrinsic is the offset FROM this lens TO the
         # camera center (not the lens position). So the lens position
         # is at -t_extrinsic, and we ADD t_local to correct the ray.
+        for R in rotations:
+            rays = xp.asarray(R) @ rays
+        rotations = []
         t_local = lens.R_extrinsic.T @ lens.t_extrinsic
         d = xp.asarray(depth_map, dtype=xp.float64)
-        Xl = d * Xl + t_local[0]
-        Yl = d * Yl + t_local[1]
-        Zl = d * Zl + t_local[2]
+        Xl = d * rays[0].reshape(eq_h, eq_w) + t_local[0]
+        Yl = d * rays[1].reshape(eq_h, eq_w) + t_local[1]
+        Zl = d * rays[2].reshape(eq_h, eq_w) + t_local[2]
 
     # Bounds check against sensor, and field of view tested on the ray angle:
     # past the fold the pixel radius shrinks again, so a radius test alone
     # accepts rays from behind the lens.
     u_src, v_src, valid = _lens_pixels(
-        Xl, Yl, Zl, lens.width, lens.height, float(np.cos(max_angle)),
-        *mei_coefficients(lens.xi, lens.K, lens=lens))
+        Xl, Yl, Zl, tuple(tuple(map(float, np.ravel(R))) for R in rotations),
+        lens.width, lens.height, float(np.cos(max_angle)),
+        mei_coefficients(lens.xi, lens.K, lens=lens))
 
     if lens.fov_deg is None:
         # No calibrated FOV: stay inside a margin of the image circle
@@ -1467,17 +1523,24 @@ def _rotate_rays_at(rs_rotations, fracs, rays):
     degree, so their matrices are interpolated linearly rather than slerped.
     """
     xp = array_module(rays)
+    if np.ndim(fracs) == 0:
+        return xp.asarray(_rotation_at(rs_rotations, fracs)) @ rays
     keys = np.array([f for f, _ in rs_rotations])
     mats = xp.asarray(Rotation.concatenate([R for _, R in rs_rotations]).as_matrix())
-    if np.ndim(fracs) == 0:
-        pos = np.interp(fracs, keys, np.arange(len(keys), dtype=np.float64))
-        idx = min(int(pos), len(keys) - 2)
-        alpha = pos - idx
-        return ((1.0 - alpha) * mats[idx] + alpha * mats[idx + 1]) @ rays
     pos = xp.interp(fracs, xp.asarray(keys), xp.arange(len(keys), dtype=xp.float64))
     idx = xp.minimum(pos.astype(xp.int64), len(keys) - 2)
     alpha = pos - idx
     return xp.stack(_rotate_interpolated(idx, alpha, *rays, mats.ravel()))
+
+
+def _rotation_at(rs_rotations, frac):
+    """The 3x3 matrix _rotate_rays_at turns rays by at one readout fraction."""
+    keys = np.array([f for f, _ in rs_rotations])
+    mats = Rotation.concatenate([R for _, R in rs_rotations]).as_matrix()
+    pos = np.interp(frac, keys, np.arange(len(keys), dtype=np.float64))
+    idx = min(int(pos), len(keys) - 2)
+    alpha = pos - idx
+    return (1.0 - alpha) * mats[idx] + alpha * mats[idx + 1]
 
 
 @fused(tables=('mats',))
@@ -1523,20 +1586,21 @@ def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
         xp = array_module(rays)
         rows = stop - first
         depth = None if depth_map is None else depth_map[first:stop]
+        rotations = []
         if rs_rotations is not None and len(rs_rotations) > 1:
             # Rolling shutter: a source pixel is exposed when its sensor row
             # is read, and rows run down the stored fisheye image. Project
             # once with the mid-readout rotation to find each pixel's row,
             # then again with the rotation at that row's time.
-            _, v_mid, _ = _project_rays(
-                lens, _rotate_rays_at(rs_rotations, 0.5, rays), eq_w, rows,
-                depth, max_angle)
+            _, v_mid, _ = _project_rays(lens, rays, eq_w, rows, depth, max_angle,
+                                        [_rotation_at(rs_rotations, 0.5)])
             row = xp.clip(xp.nan_to_num(v_mid.ravel() / lens.height, nan=0.5), 0.0, 1.0)
             rays = _rotate_rays_at(rs_rotations, row, rays)
         elif R_stabilization is not None:
-            rays = xp.asarray(R_stabilization.as_matrix()) @ rays
+            rotations = [R_stabilization.as_matrix()]
 
-        u_src, v_src, valid = _project_rays(lens, rays, eq_w, rows, depth, max_angle)
+        u_src, v_src, valid = _project_rays(lens, rays, eq_w, rows, depth, max_angle,
+                                            rotations)
 
         map_x = xp.where(valid, u_src, 0).astype(xp.float32)
         map_y = xp.where(valid, v_src, 0).astype(xp.float32)
