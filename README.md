@@ -15,16 +15,17 @@ Insta360 Studio is closed source and Windows/macOS only. Reproducing its output 
 
 ## Architecture
 
-Everything fuses into one backward remap per output pixel (following the pattern from the Insta360 SDK and Qualcomm's stabilization patent):
+Undistortion, rolling shutter and stitching fuse into one backward remap per lens, into a seam frame whose poles are the lens axes; one rotation then turns the stitch to the output:
 
 1. Parse the `.insv` into two H.265 streams and an IMU track.
 2. Parse the `.pb` sidecar for MEI calibration (xi = 2.0, 13 distortion coefficients per lens, per-lens extrinsics).
 3. Estimate gravity with a gyroscope and accelerometer complementary filter, for horizon-lock leveling with a smoothed heading.
 4. Derive per-scanline rolling-shutter rotations from the same gyro integration, 32 SLERP keyframes across the sensor readout.
-5. For each output pixel: ray, stabilize, transform into the lens frame, MEI-project, distort, sample.
-6. Blend on longitude preference times coverage depth. No hardcoded feather width.
+5. For each seam-frame pixel: ray, rolling shutter rotation, transform into the lens frame, MEI-project, distort, sample. Rays beyond half the calibrated field of view are dropped.
+6. Blend on the side of the seam times coverage depth. No hardcoded feather width.
 7. Symmetric per-channel gain across the seam.
-8. Optional DIS optical flow for close-range parallax. Optional bilateral denoise.
+8. DIS optical flow aligns the two lenses across the seam, for close-range parallax.
+9. Turn the stitch to the levelled output. Optional bilateral denoise.
 
 Full treatment in `PIPELINE.md`.
 
@@ -65,7 +66,7 @@ MISC/Camera01/VID_xxx_00_001.insv.pb
 
 IMU calibration is camera-specific. `IMU_CALIBRATION_BY_CAMERA` in `x5_pipeline.py` holds one calibration per model, each from a single unit. The X6 rotation was fitted on the gyroscope and on gravity against Studio renders. The X5 one was solved upstream via Wahba's method on the accelerometer alone; its gyro axes are unverified, so X5 leveling does not fuse the gyro. Unit-to-unit PCB mounting variation will degrade stabilization on other cameras. Pass `--no-stab`, or re-solve against a Studio render from your own hardware.
 
-Close-object parallax. Around 18 px of ghosting at the stitch line for objects under 3 m, a function of the 30 mm inter-lens baseline. DIS flow helps but does not match Insta360's learned `ai_stitch_model_v2.ins` on repetitive patterns like fence mesh or foliage.
+Close-object parallax. The 30 mm inter-lens baseline shifts close objects between the lenses, 20 px (median) on bike handlebars at 3840 px. DIS flow aligns the lenses across the seam but leaves local warping on the closest objects, and does not match Insta360's learned `ai_stitch_model_v2.ins` on repetitive patterns like fence mesh or foliage.
 
 Per-frame ffmpeg decode. Each frame spawns its own ffmpeg process, about 2 s of overhead. Piped batch decoding is the obvious next step for video throughput.
 

@@ -10,21 +10,33 @@ telemetry) and produces equirectangular 360° output.
 
 ---
 
-## Architecture: Everything Is One Remap
+## Architecture: Stitch in the Seam Frame, Then Turn
 
-Following the design principle from the Insta360 SDK and Qualcomm stabilization
-patent: stabilization, rolling shutter correction, lens undistortion, and stitching
-are fused into a **single backward-mapping** per output pixel. No double-resampling.
+Rolling shutter correction, lens undistortion and stitching are fused into one
+backward mapping per lens, into the **seam frame**: an equirectangular image whose
+poles are the lens axes, so the seam between the lenses is its equator. Blending
+and parallax correction work there, then one rotation turns the stitch to the
+output, levelled or not.
 
-For every output equirectangular pixel `(u, v)`:
+For every seam-frame pixel `(u, v)`:
 
 ```
-1. Convert (u, v) → 3D ray on unit sphere
-2. Apply per-scanline stabilization rotation (rolling shutter corrected)
+1. Convert (u, v) → 3D ray on unit sphere, then into the camera frame (CAMERA_FROM_SEAM)
+2. Apply the per-scanline rolling shutter rotation, relative to the frame centre
 3. Transform ray into fisheye lens's local frame via R_extrinsic⁻¹
 4. Project through MEI model with extended distortion → (src_x, src_y)
 5. Sample the source fisheye image at (src_x, src_y)
 ```
+
+Then every output pixel samples the stitch at `CAMERA_FROM_SEAMᵀ · R_level · ray`.
+
+**Why not one remap per output pixel.** Stitching directly in the output frame chose
+each lens by output longitude, which holds only for an upright camera. In the camera
+frame the seam runs through the camera's up and down directions, the poles of an
+equirectangular image, where blend ramps and flow bands shrink to nothing. On a bike,
+with the camera tilted by 61°, the seam crossed the handlebars 4° from the camera's
+down direction and showed as a hard horizontal cut. The seam frame samples the whole
+seam evenly. The price is a second resampling (stage 9).
 
 ---
 
@@ -102,7 +114,7 @@ Per-scanline orientation from the same gyro integration:
    - Compute capture time: `t = t_frame + (readout_frac - 0.5) × readout_time`
    - Camera motion since the frame centre, `C(t) C(t_frame)ᵀ`, interpolated from the
      integrated gyro
-   - Compose with the frame's leveling rotation (identity with `--no-stab`)
+   - Compose with the seam frame; leveling waits for the output rotation (stage 9)
 2. Each output pixel is timed by the sensor row it samples. The remap builder projects
    once with the mid-readout rotation to find that row (`v / height`: rows are read down
    the stored fisheye image), then again with the rotation interpolated at that row.
@@ -134,32 +146,40 @@ xi = 2.0 for the X5 (hyperbolic mirror model, supporting >180° FOV).
 
 ### 5. Equirectangular Remap (`build_equirect_remap`)
 
-Builds backward-mapping tables (map_x, map_y) for `cv2.remap()`:
+Builds backward-mapping tables (map_x, map_y) for `cv2.remap()`, in the seam frame:
 
-1. For each output pixel → compute 3D ray (lon/lat → X,Y,Z with Y-down convention)
-2. Apply per-scanline stabilization (RS-corrected, SLERP-interpolated)
+1. For each seam-frame pixel → compute 3D ray (`equirect_rays`: lon/lat → X,Y,Z with Y-down convention)
+2. Apply `R_row · CAMERA_FROM_SEAM` (rolling shutter, interpolated between 32 keyframes)
 3. Transform to lens-local frame via `R_extrinsic.T`
 4. Project through MEI → source fisheye coordinates
-5. Apply circular fisheye mask (5% margin from image circle edge)
+5. Keep rays within half the calibrated field of view of the lens axis (`lens_max_angle`)
+
+The field of view is tested on the ray angle, not on the pixel radius. The distortion
+polynomial folds back past its maximum (114° off axis on the X6), so rays 130° to 180°
+off axis, behind the lens, land inside the image circle again and a radius test
+accepts them. The X6 calibration gives a 193° field of view: each lens reaches 96.5°,
+and the lenses overlap over 13° instead of 6° with the former 5% radius margin. The
+fisheye image stays lit out to the frame edge. Calibrations without a field of view
+keep the radius margin, and the fold still bounds the angle.
 
 ### 6. Blending (`compute_blend_weights`)
 
-**Longitude preference × coverage depth**, no hardcoded parameters:
+**Latitude preference × coverage depth**, in the seam frame, no hardcoded feather:
 
 ```
-w_front = longitude_pref(col) × distance_from_front_edge(row, col)
-w_back  = (1 - longitude_pref(col)) × distance_from_back_edge(row, col)
+w_front = latitude_pref(row) × distance_from_front_edge(row, col)
+w_back  = (1 - latitude_pref(row)) × distance_from_back_edge(row, col)
 normalize: w_front, w_back = w_front/(w_front+w_back), ...
 ```
 
-- **Longitude preference**: Linear ramp from front-primary (|lon| < 75°) to
-  back-primary (|lon| > 105°), transitioning at ±90°
+- **Latitude preference**: Linear ramp from front-primary (15° above the seam) to
+  back-primary (15° below)
 - **Coverage depth**: `cv2.distanceTransform`. Pixels from the lens's
   validity boundary. A lens 24 px from its edge naturally gets less weight than
   one 162 px deep.
 
 This handles:
-- Hemisphere ownership (longitude)
+- Hemisphere ownership (side of the seam)
 - Coverage edge smoothness (no hard color steps at fisheye circle boundary)
 - Close-object parallax reduction (favors the lens with more central coverage)
 
@@ -173,19 +193,48 @@ This handles:
 
 This preserves each hemisphere's natural exposure while smoothing the transition.
 
-### 8. Optical Flow (Optional, `--flow`)
+### 8. Optical Flow (on by default, `--no-flow` to disable)
 
-DIS optical flow for parallax correction in the stitch bands (±15° around ±90° longitude):
+DIS optical flow for parallax correction in a band ±15° around the seam, the seam
+frame's equator:
 
-1. Extract stitch band crops from both gain-corrected lenses
+1. Take the band from both gain-corrected lenses, laid on its side so the seam runs
+   down its columns, and padded round the wrap at the camera's up direction
 2. Fill invalid pixels with the other lens's data
-3. Compute DIS flow at full resolution
-4. Partial warp: each image moves halfway (`×0.5`)
-5. DP seam finding + 5-level Laplacian pyramid multi-band blending
+3. Compute DIS flow, `front(x) ≈ back(x + flow)`, on the band scaled to the output
+   width, clamped to 8° (the lens baseline seen from 25 cm)
+4. Warp both lenses so a feature lands at `x + α·flow`, α being the back lens's blend
+   weight: the front lens stays put where it alone is valid, the back lens where it is
+5. Blend the warped lenses with the stage 6 weights, which equal the canvas wherever
+   one lens alone is valid
 
-**Impact**: Marginal improvement on close objects. The principled blending (coverage depth weighting) handles most parallax. Flow helps with fine structures like fence mesh at ~3m distance.
+**Impact**, on a bike with the handlebars across the seam (3840 px output): DIS
+measures 20 px of parallax (median), and the mean difference between the lenses on
+textured pixels drops from 34 to 16 grey levels. Over 30 consecutive frames the seam
+zone changes less from one frame to the next than in the previous render (15.7
+against 18.5 grey levels at one instant, 19.0 against 22.6 at another), while a zone
+away from the seam is unchanged: the flow adds no flicker. The closest objects keep
+local warping.
 
-### 9. Denoising (Optional, `--denoise`)
+The previous version warped the lenses apart (flow sign) and halfway only, corrected
+the band's color twice, and cut it along a DP seam with multi-band blending, which
+tore close objects.
+
+### 9. Output Rotation (`rotate_equirect`)
+
+The stitch is turned to the output by `CAMERA_FROM_SEAMᵀ · R_level(t_frame)`
+(`CAMERA_FROM_SEAMᵀ` alone with `--no-stab`), with Lanczos sampling that wraps round
+the ±180° meridian and continues across the poles.
+
+This second resampling softens the image. Stitched at the output width, 2D crops keep
+0.83 to 0.87 of the Laplacian energy of a single-remap render, and helmet vents or road
+grain look visibly softer at 1:1. The seam frame is therefore stitched at 1.5× the
+output width by default (`--stitch-width`), which keeps 0.96 to 0.98 and doubles the
+time per frame (24 s against 12 s at 3840 px, same machine). Flow is still estimated
+at the output width: estimated at the stitch width, it gives the same alignment and
+the same frame-to-frame stability.
+
+### 10. Denoising (Optional, `--denoise`)
 
 Post-stitch bilateral filter (`cv2.bilateralFilter(d=9, sigmaColor=40, sigmaSpace=40)`):
 - Preserves edges (ground texture sharpness matches GT)
@@ -206,8 +255,11 @@ uv run python3 x5_pipeline.py input.insv -o output.mp4 -w 3840 --video
 # Without stabilization
 uv run python3 x5_pipeline.py input.insv -o output.jpg --no-stab
 
-# With optical flow
-uv run python3 x5_pipeline.py input.insv -o output.jpg --flow
+# Without optical flow
+uv run python3 x5_pipeline.py input.insv -o output.jpg --no-flow
+
+# Twice as fast, softer: stitch at the output width
+uv run python3 x5_pipeline.py input.insv -o output.mp4 -w 3840 --video --stitch-width 3840
 
 # Compare to ground truth
 uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
@@ -222,7 +274,9 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
 | MEI model with xi=2.0 | Confirmed by Gyroflow source. Hyperbolic mirror handles >180° FOV |
 | cx_fix=2 for X5 | Gyroflow convention halves cx; must double for actual optical center |
 | Extended 13-coeff model | Protobuf sidecar has per-lens thin prism distortion that standard 5-coeff can't capture |
-| Longitude × depth blending | Principled: no hardcoded feather distance, naturally favors central coverage |
+| Stitch in the seam frame | Samples the whole seam evenly whatever the camera's tilt; costs a second resampling |
+| Field of view tested on the ray angle | The distortion polynomial folds back past 114°; a radius test accepts rays from behind the lens |
+| Latitude × depth blending | Principled: no hardcoded feather distance, naturally favors central coverage |
 | Symmetric gain correction | Prevents one-sided color step at the seam |
 | Per-scanline RS correction | 12-18 px displacement during the 21 ms readout, same magnitude as parallax |
 | Bilateral over NLM denoising | NLM destroys ground texture; bilateral preserves edges while matching GT noise floor |
@@ -242,10 +296,11 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
      leveling does not fuse the gyro, and its rolling shutter follows the X6 gyro sign
      unverified.
 
-2. **Close-object parallax**: Objects <3m at the stitch line show ~18px ghosting from
-   the 30mm inter-lens baseline. DIS optical flow partially corrects this but can't
-   match Insta360's neural flow model (`ai_stitch_model_v2.ins`) on repetitive patterns
-   like fence mesh.
+2. **Close-object parallax**: the ~30 mm inter-lens baseline shifts close objects
+   between the lenses (20 px median on bike handlebars at 3840 px). DIS optical flow
+   aligns most of it (stage 8) but leaves local warping on the closest objects, such as
+   a shoe or a bike light next to the camera, and can't match Insta360's neural flow
+   model (`ai_stitch_model_v2.ins`) on repetitive patterns like fence mesh.
 
 3. **Per-frame ffmpeg decode**: Each frame spawns a separate ffmpeg process (~2s overhead).
    Pipe-based batch decoding would improve video throughput.

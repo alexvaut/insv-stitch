@@ -54,6 +54,8 @@ class MEILensParams:
     # Sensor
     width: int = 3840
     height: int = 3840
+    # Calibrated field of view (deg), None when the calibration has none
+    fov_deg: float | None = None
 
     @property
     def K(self):
@@ -315,7 +317,7 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
                 p1=coeffs[5], p2=coeffs[6],
                 s1=coeffs[7], s2=coeffs[8], s3=coeffs[9], s4=coeffs[10],
                 R_extrinsic=R, t_extrinsic=np.array([tx, ty, tz]),
-                width=width, height=height,
+                width=width, height=height, fov_deg=ext[s+26],
             )
             lenses.append(lens)
 
@@ -616,10 +618,10 @@ def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
     composed with the frame's leveling rotation (level horizon, smoothed
     heading).
 
-    Because the returned rotation is TOTAL, and because build_equirect_remap
-    ignores its R_stabilization argument whenever rs_rotations is supplied,
-    this function alone decides whether the output is levelled. With
-    apply_leveling=False the camera stays in its own frame.
+    build_equirect_remap ignores its R_stabilization argument whenever
+    rs_rotations is supplied, so the returned rotation is TOTAL. With
+    apply_leveling=False the camera stays in its own frame; X5Pipeline asks for
+    that, composes the seam frame, and levels the stitched image afterwards.
 
     Returns: list of (scanline_frac, Rotation) pairs, or None without IMU data.
     """
@@ -788,6 +790,85 @@ def mei_forward(X, Y, Z, xi, K, D_or_lens=None, lens=None):
 # ============================================================
 # 6. Equirectangular Remap Builder
 # ============================================================
+#
+# The stitch is built in the seam frame, whose poles are the lens axes: the
+# front lens looks at its north pole, the back lens at its south pole, and the
+# seam between them is the equator, sampled evenly all the way round. In the
+# camera frame the seam runs through the camera's up and down directions, the
+# poles of a camera-frame equirectangular image, where blend ramps and flow
+# bands shrink to nothing; on a tilted camera a close object can sit there
+# (4 deg from the handlebars on a bike). Seam longitude 0 is the camera's down
+# direction, so the band wraps at its up direction. stitch_frame then turns
+# the stitch to the output.
+
+# camera ray = CAMERA_FROM_SEAM @ seam-frame ray
+CAMERA_FROM_SEAM = Rotation.from_euler('X', -90, degrees=True)
+
+
+def equirect_rays(eq_w, eq_h):
+    """Unit rays (3, eq_h * eq_w) through an equirectangular grid, Y down."""
+    uu, vv = np.meshgrid(
+        np.arange(eq_w, dtype=np.float64),
+        np.arange(eq_h, dtype=np.float64))
+
+    lon = (uu / eq_w) * 2 * np.pi - np.pi
+    lat = np.pi / 2 - (vv / eq_h) * np.pi
+
+    return np.stack([(np.cos(lat) * np.sin(lon)).ravel(),
+                     (-np.sin(lat)).ravel(),   # Y-down camera convention
+                     (np.cos(lat) * np.cos(lon)).ravel()], axis=0)
+
+
+def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4):
+    """
+    Resample an equirectangular image so that the output direction r shows the
+    input's direction R @ r, at out_w x out_h (default: the input size); rays
+    are the output grid's equirect_rays, when already at hand. Lanczos,
+    wrapping round the ±180 deg meridian and across the poles; pad covers the
+    kernel's reach.
+    """
+    h, w = image.shape[:2]
+    out_w, out_h = out_w or w, out_h or h
+    if rays is None:
+        rays = equirect_rays(out_w, out_h)
+    x, y, z = R.as_matrix().astype(rays.dtype) @ rays
+    map_x = (np.arctan2(x, z) + np.pi) / (2 * np.pi) * w + pad
+    map_y = (np.pi / 2 - np.arcsin(np.clip(-y, -1.0, 1.0))) / np.pi * h + pad
+
+    # Past the top pole (row 0), row -k is row k half a turn round. The bottom
+    # pole would be row h: it takes the mean of the last row, and row h + k is
+    # row h - k half a turn round.
+    rows = np.arange(-pad, h + pad)
+    src = np.where(rows < 0, -rows, np.minimum(rows, 2 * h - rows)).clip(max=h - 1)
+    cols = np.arange(-pad, w + pad)
+    padded = image[src][:, cols % w]
+    past_pole = (rows < 0) | (rows >= h)
+    padded[past_pole] = image[src[past_pole]][:, (cols + w // 2) % w]
+    padded[pad + h] = image[h - 1].mean(axis=0)
+
+    return cv2.remap(padded, map_x.astype(np.float32).reshape(out_h, out_w),
+                     map_y.astype(np.float32).reshape(out_h, out_w),
+                     cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+
+
+def lens_max_angle(lens, samples=721):
+    """
+    Largest angle (rad) between a ray and the optical axis for the lens to
+    image it: half the calibrated FOV, and never past the fold of the
+    distortion polynomial (114 deg on the X6), beyond which rays from behind
+    the lens land inside the image circle again.
+    """
+    theta = np.linspace(0.0, np.pi, samples, endpoint=False)
+    azimuth = np.linspace(0.0, 2 * np.pi, 8, endpoint=False)[:, np.newaxis]
+    u, v, _ = mei_forward(np.sin(theta) * np.cos(azimuth),
+                          np.sin(theta) * np.sin(azimuth),
+                          np.broadcast_to(np.cos(theta), (8, samples)),
+                          lens.xi, lens.K, lens=lens)
+    fold = theta[np.argmax(np.hypot(u - lens.cx, v - lens.cy), axis=1)].min()
+    if lens.fov_deg is None:
+        return fold
+    return min(fold, np.radians(lens.fov_deg) / 2.0)
+
 
 def _project_rays(lens, rays, eq_w, eq_h, depth_map=None):
     """Camera-frame rays (3, eq_h * eq_w) to fisheye source pixels and validity."""
@@ -821,12 +902,18 @@ def _project_rays(lens, rays, eq_w, eq_h, depth_map=None):
     valid = valid & (u_src >= 0) & (u_src < lens.width - 1)
     valid = valid & (v_src >= 0) & (v_src < lens.height - 1)
 
-    # Circular fisheye mask
-    margin = 0.05
-    r_max = min(lens.width, lens.height) / 2.0 * (1.0 - margin)
-    dist_from_center = np.sqrt(
-        (u_src - lens.cx) ** 2 + (v_src - lens.cy) ** 2)
-    valid = valid & (dist_from_center < r_max)
+    # Field of view, tested on the ray angle: past the fold the pixel radius
+    # shrinks again, so a radius test alone accepts rays from behind the lens.
+    cos_axis = Zl / np.maximum(np.sqrt(Xl * Xl + Yl * Yl + Zl * Zl), 1e-12)
+    valid = valid & (cos_axis > np.cos(lens_max_angle(lens)))
+
+    if lens.fov_deg is None:
+        # No calibrated FOV: stay inside a margin of the image circle
+        margin = 0.05
+        r_max = min(lens.width, lens.height) / 2.0 * (1.0 - margin)
+        dist_from_center = np.sqrt(
+            (u_src - lens.cx) ** 2 + (v_src - lens.cy) ** 2)
+        valid = valid & (dist_from_center < r_max)
     return u_src, v_src, valid
 
 
@@ -867,18 +954,7 @@ def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
             to the standard projection; at finite d, close objects shift
             to their geometrically correct position for this specific lens.
     """
-    uu, vv = np.meshgrid(
-        np.arange(eq_w, dtype=np.float64),
-        np.arange(eq_h, dtype=np.float64))
-
-    lon = (uu / eq_w) * 2 * np.pi - np.pi
-    lat = np.pi / 2 - (vv / eq_h) * np.pi
-
-    ray_x = np.cos(lat) * np.sin(lon)
-    ray_y = -np.sin(lat)   # Y-down camera convention
-    ray_z = np.cos(lat) * np.cos(lon)
-
-    rays = np.stack([ray_x.ravel(), ray_y.ravel(), ray_z.ravel()], axis=0)
+    rays = equirect_rays(eq_w, eq_h)
     if rs_rotations is not None and len(rs_rotations) > 1:
         # Rolling shutter: a source pixel is exposed when its sensor row is
         # read, and rows run down the stored fisheye image. Project once with
@@ -914,30 +990,23 @@ def remap_fisheye(fisheye_bgr, map_x, map_y, valid):
 def compute_blend_weights(valid_front, valid_back, eq_w, eq_h,
                           blend_width_deg=15.0):
     """
-    Blend weights combining longitude preference with coverage depth.
+    Blend weights in the seam frame (see CAMERA_FROM_SEAM), combining
+    latitude preference with coverage depth.
 
     In the overlap region, each lens's weight is proportional to:
-      longitude_preference × coverage_depth
+      latitude_preference × coverage_depth
 
     This naturally:
-    - Assigns front/back hemisphere ownership via longitude
+    - Assigns front/back hemisphere ownership by the side of the seam
     - Favors the lens further from its fisheye edge (more central = less
       distortion, less parallax). No hardcoded feather distance needed
     - Smoothly transitions at coverage boundaries
     """
-    # Longitude preference: front owns |lon| < 90°, back owns |lon| > 90°
-    cols = np.arange(eq_w, dtype=np.float32)
-    lon_deg = (cols / eq_w) * 360.0 - 180.0
-    abs_lon = np.abs(lon_deg)
-
-    lo = 90.0 - blend_width_deg
-    hi = 90.0 + blend_width_deg
-
-    front_pref = np.ones(eq_w, dtype=np.float32)
-    ramp = (abs_lon >= lo) & (abs_lon <= hi)
-    front_pref[ramp] = 1.0 - (abs_lon[ramp] - lo) / (hi - lo)
-    front_pref[abs_lon > hi] = 0.0
-    front_pref_2d = np.broadcast_to(front_pref[np.newaxis, :], (eq_h, eq_w))
+    # Latitude preference: the front lens owns the upper half, ramping over
+    # blend_width_deg on either side of the seam
+    lat_deg = 90.0 - np.arange(eq_h, dtype=np.float32) / eq_h * 180.0
+    front_pref = np.clip(0.5 + lat_deg / (2.0 * blend_width_deg), 0.0, 1.0)
+    front_pref_2d = np.broadcast_to(front_pref[:, np.newaxis], (eq_h, eq_w))
 
     # Coverage depth: how far each pixel is from its lens's coverage edge
     front_dist = cv2.distanceTransform(
@@ -1048,85 +1117,7 @@ class FlowEngine:
 
 
 # ============================================================
-# 9. Seam Finding (DP)
-# ============================================================
-
-def find_seam_dp(img_a, img_b):
-    """Optimal vertical seam via dynamic programming."""
-    h, w = img_a.shape[:2]
-    diff = np.linalg.norm(
-        img_a.astype(np.float32) - img_b.astype(np.float32), axis=2)
-    ga = cv2.Sobel(cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY), cv2.CV_32F, 1, 0)
-    gb = cv2.Sobel(cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY), cv2.CV_32F, 1, 0)
-    cost = diff + 0.5 * np.abs(ga - gb)
-
-    dp = cost.copy()
-    for row in range(1, h):
-        for col in range(w):
-            lo, hi = max(0, col - 1), min(w, col + 2)
-            dp[row, col] += dp[row - 1, lo:hi].min()
-
-    seam = np.zeros(h, dtype=np.int32)
-    seam[-1] = dp[-1].argmin()
-    for row in range(h - 2, -1, -1):
-        c = seam[row + 1]
-        lo, hi = max(0, c - 1), min(w, c + 2)
-        seam[row] = lo + dp[row, lo:hi].argmin()
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for row in range(h):
-        mask[row, :seam[row]] = 255
-    return mask
-
-
-# ============================================================
-# 10. Multi-Band Blending
-# ============================================================
-
-def _gaussian_pyramid(img, levels):
-    pyr = [img.astype(np.float64)]
-    for _ in range(levels - 1):
-        pyr.append(cv2.pyrDown(pyr[-1]))
-    return pyr
-
-
-def _laplacian_pyramid(img, levels):
-    gauss = _gaussian_pyramid(img, levels)
-    lap = []
-    for i in range(levels - 1):
-        h, w = gauss[i].shape[:2]
-        up = cv2.pyrUp(gauss[i + 1], dstsize=(w, h))
-        lap.append(gauss[i] - up)
-    lap.append(gauss[-1])
-    return lap
-
-
-def multiband_blend(img_a, img_b, seam_mask, levels=5, feather_px=10):
-    """Laplacian pyramid multi-band blending."""
-    a = img_a.astype(np.float64)
-    b = img_b.astype(np.float64)
-    mask = seam_mask.astype(np.float64) / 255.0
-    if feather_px > 0:
-        mask = cv2.GaussianBlur(mask, (0, 0), feather_px)
-    if mask.ndim == 2:
-        mask = np.stack([mask] * 3, axis=2)
-
-    la = _laplacian_pyramid(a, levels)
-    lb = _laplacian_pyramid(b, levels)
-    gm = _gaussian_pyramid(mask, levels)
-
-    blended = [l_a * g + l_b * (1.0 - g) for l_a, l_b, g in zip(la, lb, gm)]
-
-    result = blended[-1]
-    for i in range(len(blended) - 2, -1, -1):
-        h, w = blended[i].shape[:2]
-        result = cv2.pyrUp(result, dstsize=(w, h)) + blended[i]
-
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-# ============================================================
-# 11. Pipeline Orchestrator
+# 9. Pipeline Orchestrator
 # ============================================================
 
 def find_overlap_bands(valid_front, valid_back):
@@ -1147,10 +1138,19 @@ class X5Pipeline:
 
     def __init__(self, insv_path, eq_width=3840,
                  enable_stabilization=True, enable_flow=True,
-                 denoise=False):
+                 denoise=False, stitch_width=None):
         self.insv_path = insv_path
         self.eq_w = eq_width
         self.eq_h = eq_width // 2
+        # The stitch is built in the seam frame, then turned to the output. At
+        # the output width that second resampling visibly softens detail; at
+        # 1.5x it matches a single remap, for twice the time per frame.
+        self.st_w = stitch_width or eq_width * 3 // 2
+        self.st_h = self.st_w // 2
+        # Width of the seam frame as seen by the parallax flow
+        self.flow_width = min(eq_width, self.st_w)
+        # Output directions, turned into the seam frame after each stitch
+        self.out_rays = equirect_rays(self.eq_w, self.eq_h).astype(np.float32)
         self.enable_stabilization = enable_stabilization
         self.enable_flow = enable_flow
         self.denoise = denoise
@@ -1174,100 +1174,82 @@ class X5Pipeline:
             self.flow_engine = FlowEngine()
 
         print("[4/4] Ready.")
-        print(f"  Output: {self.eq_w}x{self.eq_h}")
+        print(f"  Output: {self.eq_w}x{self.eq_h}, stitched at {self.st_w}x{self.st_h}")
 
     def _build_maps(self, frame_idx=0, depth_map=None):
-        """Build remap tables with stabilization + rolling shutter correction."""
-        # Per-scanline rotations carry the gravity leveling too, so leveling
-        # is switched here.
+        """Seam-frame remap tables with rolling shutter correction."""
+        # The maps stay in the seam frame; stitch_frame levels the result.
         rs_rots = compute_rs_rotations(
             self.imu_orientation, frame_idx, self.meta.fps,
             self.meta.frame_readout_time, n_scanlines=32,
-            apply_leveling=self.enable_stabilization)
+            apply_leveling=False)
+        if rs_rots is not None:
+            rs_rots = [(f, R * CAMERA_FROM_SEAM) for f, R in rs_rots]
 
         self.maps = []
         for lens in self.meta.lens_params:
             mx, my, valid = build_equirect_remap(
-                lens, self.eq_w, self.eq_h, rs_rotations=rs_rots,
-                depth_map=depth_map)
+                lens, self.st_w, self.st_h, R_stabilization=CAMERA_FROM_SEAM,
+                rs_rotations=rs_rots, depth_map=depth_map)
             self.maps.append((mx, my, valid))
 
         self.w_front, self.w_back = compute_blend_weights(
-            self.maps[0][2], self.maps[1][2], self.eq_w, self.eq_h)
+            self.maps[0][2], self.maps[1][2], self.st_w, self.st_h)
 
-        # Store RS params for depth-corrected rebuild
-        self._last_rs_rots = rs_rots
+    def _seam_from_output(self, frame_num):
+        """Rotation taking output directions into the seam frame."""
+        R = CAMERA_FROM_SEAM.inv()
+        if self.enable_stabilization and self.imu_orientation is not None:
+            R = R * self.imu_orientation.leveling_at(frame_num / self.meta.fps)
+        return R
 
-    def _estimate_depth_and_rebuild(self, front_fish, back_fish):
+    def _align_band(self, fc, bc, valid_f, valid_b, alpha):
         """
-        Disparity-adaptive blending: sharpen blend weights near close objects.
-
-        The standard longitude×depth blending produces ghosting when close
-        objects straddle the stitch line (the two lenses see them from
-        different positions). This method detects high-disparity regions
-        via DIS flow in the stitch bands and sharpens the blend there,
-        strongly favoring whichever lens has the pixel more centrally.
-
-        The key insight: blending two misaligned views of a close object
-        creates ghosting. Picking ONE view (the better one) eliminates
-        the ghost at the cost of a sharper transition, which is less
-        visible than the ghost.
+        Warp both lenses of a band whose seam runs down its columns, front lens
+        on the left, onto a common position given by DIS flow. alpha is the
+        back lens's blend weight: where it is 0 the front lens stays put, where
+        it is 1 the back lens does, so the band meets the single-lens image on
+        either side without a step.
         """
-        eq_front = remap_fisheye(front_fish, *self.maps[0])
-        eq_back = remap_fisheye(back_fish, *self.maps[1])
-        valid_f, valid_b = self.maps[0][2], self.maps[1][2]
-        overlap = valid_f & valid_b
+        # Fill invalid pixels with the other lens's data before flow
+        # so DIS doesn't try to match black regions to content.
+        fc = np.where(valid_f[:, :, np.newaxis], fc, bc)
+        bc = np.where(valid_b[:, :, np.newaxis], bc, fc)
 
-        if not overlap.any():
-            return
+        # Flow is estimated with the seam frame scaled to flow_width.
+        fg = cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)
+        bg = cv2.cvtColor(bc, cv2.COLOR_BGR2GRAY)
+        scale = self.flow_width / self.st_w
+        if scale < 1.0:
+            size = (round(fg.shape[1] * scale), round(fg.shape[0] * scale))
+            flow = self.flow_engine.compute(
+                cv2.resize(fg, size, interpolation=cv2.INTER_AREA),
+                cv2.resize(bg, size, interpolation=cv2.INTER_AREA))
+            flow = cv2.resize(flow, (fg.shape[1], fg.shape[0])) / scale
+        else:
+            flow = self.flow_engine.compute(fg, bg)
 
-        # Compute flow in the stitch bands to detect parallax
-        stitch_half_deg = 15.0
-        parallax_map = np.zeros((self.eq_h, self.eq_w), dtype=np.float32)
+        # Clamp flow magnitude to physical limit: the ~30 mm lens baseline
+        # seen from 25 cm spans about 8 deg
+        max_flow = 8.0 / 360.0 * self.st_w
+        mag = np.linalg.norm(flow, axis=2, keepdims=True)
+        flow *= np.minimum(1.0, max_flow / (mag + 1e-6))
 
-        for stitch_lon in [90.0, 270.0]:
-            col_center = int(stitch_lon / 360.0 * self.eq_w)
-            hw = int(stitch_half_deg / 360.0 * self.eq_w)
-            cs = max(0, col_center - hw)
-            ce = min(self.eq_w, col_center + hw)
+        # Zero flow outside the overlap (no correction needed there)
+        flow[~(valid_f & valid_b)] = 0
 
-            band_ov = overlap[:, cs:ce]
-            if not band_ov.any():
-                continue
+        # DIS gives front(x) ~ back(x + flow). A feature at x in the front
+        # lens is drawn at x + alpha * flow by both warped lenses.
+        h, w = flow.shape[:2]
+        ys, xs = np.mgrid[:h, :w].astype(np.float32)
+        fw = cv2.remap(fc, xs - alpha * flow[:, :, 0],
+                       ys - alpha * flow[:, :, 1],
+                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        bw = cv2.remap(bc, xs + (1 - alpha) * flow[:, :, 0],
+                       ys + (1 - alpha) * flow[:, :, 1],
+                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-            fc = eq_front[:, cs:ce].copy()
-            bc = eq_back[:, cs:ce].copy()
-            fc[~valid_f[:, cs:ce]] = bc[~valid_f[:, cs:ce]]
-            bc[~valid_b[:, cs:ce]] = fc[~valid_b[:, cs:ce]]
-
-            fg = cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)
-            bg = cv2.cvtColor(bc, cv2.COLOR_BGR2GRAY)
-
-            dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-            dis.setFinestScale(0)
-            flow = dis.calc(fg, bg, None)
-
-            mag = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
-            mag[~band_ov] = 0
-            parallax_map[:, cs:ce] = np.maximum(parallax_map[:, cs:ce], mag)
-
-        # Smooth the parallax map
-        parallax_map = cv2.GaussianBlur(parallax_map, (0, 0), 5)
-
-        # Where parallax is high (close objects), sharpen the blend:
-        # push weights toward 0 or 1 based on which lens dominates.
-        # The threshold scales with resolution (more pixels = more parallax)
-        threshold = self.eq_w / 960.0  # ~2px at 1920, ~8px at 7680
-        sharpening = np.clip(parallax_map / max(threshold, 0.5), 0, 1)
-
-        # Sharpen: w = w^(1+sharpening*3) then renormalize
-        # This pushes weights toward 0/1 where parallax is high
-        power = 1.0 + sharpening * 4.0
-        w_f = self.w_front ** power
-        w_b = self.w_back ** power
-        total = np.maximum(w_f + w_b, 1e-6)
-        self.w_front = w_f / total
-        self.w_back = w_b / total
+        return fw, bw
 
     def stitch_frame(self, frame_num=0, frames=None):
         """
@@ -1329,108 +1311,32 @@ class X5Pipeline:
             eq_back.astype(np.float32) * self.w_back[:, :, np.newaxis],
             0, 255).astype(np.uint8)
 
-        if self.enable_flow:
-            # Apply flow + seam only in the stitch-line regions (~±90° lon).
-            # Two stitch bands: one on the left side (~270° = col near 3/4),
-            # one on the right side (~90° = col near 1/4).
-            stitch_half_width_deg = 15.0
-            stitch_bands = []
-            for stitch_lon_deg in [90.0, 270.0]:
-                col_center = int(stitch_lon_deg / 360.0 * self.eq_w)
-                hw = int(stitch_half_width_deg / 360.0 * self.eq_w)
-                col_s = max(0, col_center - hw)
-                col_e = min(self.eq_w, col_center + hw)
-                stitch_bands.append((col_s, col_e))
+        if self.enable_flow and overlap_mask.any():
+            # Parallax correction in a band around the seam, the seam frame's
+            # equator. The band is laid on its side so the seam runs down its
+            # columns, front lens on the left, and padded round the wrap at the
+            # camera's up direction.
+            hw = int(15.0 / 180.0 * self.st_h)
+            rows = slice(self.st_h // 2 - hw, self.st_h // 2 + hw)
 
-            for col_s, col_e in stitch_bands:
-                band_w = col_e - col_s
-                if band_w < 10:
-                    continue
+            def band(image):
+                image = np.concatenate([image[:, -hw:], image, image[:, :hw]], axis=1)
+                return np.ascontiguousarray(np.swapaxes(image, 0, 1))
 
-                # Check both lenses have coverage in this band
-                band_valid_f = valid_f[:, col_s:col_e].any()
-                band_valid_b = valid_b[:, col_s:col_e].any()
-                if not (band_valid_f and band_valid_b):
-                    continue
+            # The aligned lenses are blended with the canvas weights, so the
+            # band matches the canvas wherever one lens alone is valid.
+            alpha = band(self.w_back[rows])
+            fw, bw = self._align_band(band(eq_front[rows]), band(eq_back[rows]),
+                                      band(valid_f[rows]), band(valid_b[rows]),
+                                      alpha)
+            alpha = alpha[:, :, np.newaxis]
+            blended = fw * (1.0 - alpha) + bw * alpha
+            result[rows] = np.clip(np.swapaxes(blended, 0, 1)[:, hw:-hw],
+                                   0, 255).astype(np.uint8)
 
-                s = col_s
-                e = col_e
-
-                band_overlap = valid_f[:, s:e] & valid_b[:, s:e]
-                band_vf = valid_f[:, s:e]
-                band_vb = valid_b[:, s:e]
-
-                # For flow: use fully corrected versions of both lenses
-                # (symmetric sqrt(gain) correction applied to both)
-                if overlap_mask.any():
-                    fc = np.clip(eq_front_f[:, s:e] * inv_sqrt_gain[:, s:e],
-                                 0, 255).astype(np.uint8)
-                    bc = np.clip(eq_back_f[:, s:e] * sqrt_gain[:, s:e],
-                                 0, 255).astype(np.uint8)
-                else:
-                    fc = eq_front[:, s:e].copy()
-                    bc = eq_back[:, s:e].copy()
-
-                # Fill invalid pixels with the other lens's data before flow
-                # so DIS doesn't try to match black regions to content.
-                fc[~band_vf] = bc[~band_vf]
-                bc[~band_vb] = fc[~band_vb]
-
-                # Multi-scale DIS optical flow: compute at 1/4 resolution
-                # for a smooth displacement field that captures coarse parallax
-                # without mesh/texture-level noise.
-                h, w = fc.shape[:2]
-                flow_scale = 1
-                h_s, w_s = h // flow_scale, w // flow_scale
-                fc_small = cv2.resize(fc, (w_s, h_s))
-                bc_small = cv2.resize(bc, (w_s, h_s))
-                fg = cv2.cvtColor(fc_small, cv2.COLOR_BGR2GRAY)
-                bg = cv2.cvtColor(bc_small, cv2.COLOR_BGR2GRAY)
-                flow_small = self.flow_engine.compute(fg, bg)
-                flow = cv2.resize(flow_small, (w, h)) * flow_scale
-
-                # Clamp flow magnitude to physical limit
-                mag = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
-                max_flow = 40.0
-                scale = np.where(mag > max_flow, max_flow / (mag + 1e-6), 1.0)
-                flow[:, :, 0] *= scale
-                flow[:, :, 1] *= scale
-
-                # Zero flow outside the overlap (no correction needed there)
-                flow[~band_overlap] = 0
-
-                # Partial flow warp: each image moves halfway toward
-                # the other to reduce parallax in the overlap.
-                h, w = flow.shape[:2]
-                ys, xs = np.mgrid[:h, :w].astype(np.float32)
-
-                alpha = np.linspace(0, 1, w, dtype=np.float32).reshape(1, -1)
-                alpha = np.broadcast_to(alpha, (h, w))
-
-                fw = cv2.remap(fc, xs + alpha * flow[:, :, 0] * 0.5,
-                               ys + alpha * flow[:, :, 1] * 0.5,
-                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                bw_img = cv2.remap(bc, xs - (1 - alpha) * flow[:, :, 0] * 0.5,
-                                   ys - (1 - alpha) * flow[:, :, 1] * 0.5,
-                                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-                # Seam finding + multi-band blending
-                seam = find_seam_dp(fw, bw_img)
-                blended = multiband_blend(fw, bw_img, seam,
-                                          levels=5, feather_px=25)
-
-                # Only write where both lenses are valid
-                blend_mask = band_overlap[:, :, np.newaxis].astype(np.float32)
-                orig = result[:, s:e].astype(np.float32)
-                result[:, s:e] = np.clip(
-                    blended * blend_mask + orig * (1 - blend_mask),
-                    0, 255).astype(np.uint8)
-        else:
-            # Simple weighted blend (no flow)
-            result = np.clip(
-                eq_front.astype(np.float32) * self.w_front[:, :, np.newaxis] +
-                eq_back.astype(np.float32) * self.w_back[:, :, np.newaxis],
-                0, 255).astype(np.uint8)
+        # Turn the stitch from the seam frame to the output
+        result = rotate_equirect(result, self._seam_from_output(frame_num),
+                                 self.eq_w, self.eq_h, self.out_rays)
 
         # Optional edge-preserving denoise (bilateral filter)
         if self.denoise:
@@ -1488,7 +1394,7 @@ class X5Pipeline:
 
 
 # ============================================================
-# 12. Ground Truth Comparison
+# 10. Ground Truth Comparison
 # ============================================================
 
 def extract_gt_frame(gt_path, frame_num=0):
@@ -1528,6 +1434,10 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', default='output.jpg')
     parser.add_argument('-f', '--frame', type=int, default=0)
     parser.add_argument('-w', '--width', type=int, default=3840)
+    parser.add_argument('--stitch-width', type=int, default=None,
+                        help='Width of the seam-frame stitch before it is '
+                             'turned to the output (default: 1.5x --width; '
+                             '--width is twice as fast but softer)')
     parser.add_argument('--no-stab', action='store_true',
                         help='Disable IMU stabilization')
     parser.add_argument('--no-flow', action='store_true',
@@ -1546,7 +1456,8 @@ if __name__ == '__main__':
     pipeline = X5Pipeline(args.input, eq_width=args.width,
                           enable_stabilization=not args.no_stab,
                           enable_flow=not args.no_flow,
-                          denoise=args.denoise)
+                          denoise=args.denoise,
+                          stitch_width=args.stitch_width)
 
     if args.video:
         pipeline.stitch_video(args.output, args.start, args.end)
