@@ -243,6 +243,40 @@ Post-stitch bilateral filter (`cv2.bilateralFilter(d=9, sigmaColor=40, sigmaSpac
 
 ---
 
+## Compute Backend
+
+The per-pixel stages take numpy or CuPy arrays and run where their inputs live:
+`--device gpu` stitches on an NVIDIA GPU with CuPy, `--device cpu` on the CPU, and the
+default `auto` takes the GPU when CuPy finds one.
+
+**The GPU matches the CPU bit for bit.** DIS flow requires it: a single grey level of
+difference on four pixels of its input moved the flow by up to 35 px and changed the
+aligned band by up to 243 levels. Each GPU stage reproduces its CPU counterpart:
+
+| Stage | GPU implementation |
+|---|---|
+| Lanczos remap (lenses, output rotation) | CUDA kernel with OpenCV's 1/32 px rounding and 15-bit fixed-point weight tables |
+| Bilinear remap (flow warp) | CUDA kernel with OpenCV 5's float interpolation and fused multiply-adds |
+| Gaussian blur of the color gain | CUDA kernel accumulating as OpenCV's SIMD code does: fused multiply-adds up to the last multiple of 8 columns, plain sums after |
+| MEI projection, validity, rolling shutter rotation | kernels traced from the numpy code itself (`fused`), in numpy's order of operations and without multiply-add contraction; `cupy.fuse` contracts them, and the strongly cancelling X6 polynomial turns that into float32 steps |
+| Output rotation tables | on the CPU, on a side thread: float32 arctan2 and arcsin round differently on the GPU |
+| Distance transform, DIS flow, flow resizing | on the CPU |
+
+**CPU shortcuts, all exact.** Map building runs in row blocks across a thread pool. Blend
+weights, distance transforms and the color gain only touch the rows holding overlap:
+outside them one lens takes each pixel whole. The distance transform runs on a strip past
+those rows, and falls back to the whole image when a distance reaches the strip's edge
+(a 5×5 chamfer distance is at least the row offset). The seam-frame rays are cached.
+
+**Video.** The reader seeks on the input side (frame 1388 in 0.8 s instead of 52 s, the
+same frames); decoding and encoding run on their own threads.
+
+`tests/test_backend.py` checks each equivalence. Five reference renders of an X6 clip
+(two frames, with and without flow, without stabilization, stitched at 3840) are identical
+to the pixel on the CPU and the GPU.
+
+---
+
 ## Usage
 
 ```bash
@@ -302,10 +336,7 @@ uv run python3 x5_pipeline.py input.insv -o output.jpg --gt ground_truth.mp4
    a shoe or a bike light next to the camera, and can't match Insta360's neural flow
    model (`ai_stitch_model_v2.ins`) on repetitive patterns like fence mesh.
 
-3. **Per-frame ffmpeg decode**: Each frame spawns a separate ffmpeg process (~2s overhead).
-   Pipe-based batch decoding would improve video throughput.
-
-4. **Rolling shutter timing**: rows are timed by their position on the sensor, but the
+3. **Rolling shutter timing**: rows are timed by their position on the sensor, but the
    readout is assumed to start at the frame time minus half the readout, and the same
    offset serves both sensors. It was tuned on one bumpy stretch of one clip.
 
@@ -322,4 +353,5 @@ MISC/Camera01/input.insv.pb         Protobuf sidecar (extended calibration)
 
 ```
 numpy, opencv-contrib-python, scipy, telemetry-parser
+cupy-cuda13x[ctk] (optional, for the GPU)
 ```

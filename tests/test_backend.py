@@ -57,6 +57,19 @@ def test_row_blocks_match_one_call():
     assert np.abs(my - np.where(ref_valid, v, 0)).max() < 1e-3
 
 
+def test_interpolated_rotation_matches_einsum():
+    rays = xp.equirect_rays(256, 128)
+    fracs = np.random.default_rng(7).uniform(0, 1, rays.shape[1])
+    keys = np.array([f for f, _ in RS_ROTATIONS])
+    mats = Rotation.concatenate([R for _, R in RS_ROTATIONS]).as_matrix()
+    pos = np.interp(fracs, keys, np.arange(len(keys), dtype=np.float64))
+    idx = np.minimum(pos.astype(np.int64), len(keys) - 2)
+    a = (pos - idx)[:, None, None]
+    M = (1.0 - a) * mats[idx] + a * mats[idx + 1]
+    assert np.array_equal(xp._rotate_rays_at(RS_ROTATIONS, fracs, rays),
+                          np.einsum('nij,jn->in', M, rays))
+
+
 def test_blur_rows_matches_whole_image_blur():
     img = np.zeros((900, 400), np.float32)
     img[400:500] = np.random.default_rng(2).uniform(0, 3, (100, 400))

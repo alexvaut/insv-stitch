@@ -39,6 +39,14 @@ uv sync
 pip install -e .
 ```
 
+For the GPU, an NVIDIA card and CuPy. The pipeline stitches on the GPU whenever CuPy finds one; `--device cpu` forces the CPU.
+
+```bash
+uv sync --extra gpu
+# or
+pip install -e .[gpu]
+```
+
 ## Usage
 
 ```bash
@@ -53,7 +61,23 @@ uv run python x5_pipeline.py input.insv --no-stab -o output.jpg
 
 # PSNR against a Studio-rendered reference
 uv run python x5_pipeline.py input.insv --gt studio_render.mp4 -o output.jpg
+
+# on the CPU, even with a GPU available
+uv run python x5_pipeline.py input.insv -o output.mp4 --video --device cpu
 ```
+
+## Speed
+
+X6 clip, 3840 output stitched at 5760, stabilization and flow on, Core Ultra 9 275HX with an RTX 5090 Laptop GPU:
+
+| | Seconds per frame |
+|---|---|
+| Before GPU support (CPU) | 24 |
+| CPU | 6.7 |
+| GPU, one frame | 0.35 |
+| GPU, video (decode and encode included) | 0.39 |
+
+The CPU and the GPU both render the image the pipeline rendered before GPU support, bit for bit. DIS flow needs it: a one-level change of its input moves the flow by tens of pixels. See "Compute Backend" in `PIPELINE.md`.
 
 The `.insv` needs to sit inside the camera's default layout:
 
@@ -67,8 +91,6 @@ MISC/Camera01/VID_xxx_00_001.insv.pb
 IMU calibration is camera-specific. `IMU_CALIBRATION_BY_CAMERA` in `x5_pipeline.py` holds one calibration per model, each from a single unit. The X6 rotation was fitted on the gyroscope and on gravity against Studio renders. The X5 one was solved upstream via Wahba's method on the accelerometer alone; its gyro axes are unverified, so X5 leveling does not fuse the gyro. Unit-to-unit PCB mounting variation will degrade stabilization on other cameras. Pass `--no-stab`, or re-solve against a Studio render from your own hardware.
 
 Close-object parallax. The 30 mm inter-lens baseline shifts close objects between the lenses, 20 px (median) on bike handlebars at 3840 px. DIS flow aligns the lenses across the seam but leaves local warping on the closest objects, and does not match Insta360's learned `ai_stitch_model_v2.ins` on repetitive patterns like fence mesh or foliage.
-
-Per-frame ffmpeg decode. Each frame spawns its own ffmpeg process, about 2 s of overhead. Piped batch decoding is the obvious next step for video throughput.
 
 ## License
 

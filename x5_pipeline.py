@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from fractions import Fraction
 import functools
+import inspect
 from functools import cache
 from pathlib import Path
 from string import Template
@@ -80,40 +81,53 @@ def _thread_pool():
     return ThreadPoolExecutor(os.cpu_count())
 
 
+@cache
+def _side_thread():
+    """A thread for work running alongside a stitch; it may use the thread pool."""
+    return ThreadPoolExecutor(1)
+
+
 def parallel_map(fn, *iterables):
     """list(map(fn, ...)) across the thread pool (numpy and OpenCV release the GIL)."""
     return list(_thread_pool().map(fn, *iterables))
 
 
-def fused(fn):
+def fused(*, tables=()):
     """
-    fn(xp, *args), made of elementwise arithmetic and comparisons, xp.sqrt,
-    xp.maximum and xp.where on its array and float arguments: called as plain
-    numpy on numpy arrays, and on CuPy arrays as one CUDA kernel traced from
-    the same code. The kernel keeps numpy's order of operations and fuses no
-    multiply-adds, so it matches numpy bit for bit (cupy.fuse contracts them,
-    which moves a distorted pixel by a float32 step).
+    Decorator for fn(xp, *args), made of elementwise arithmetic and
+    comparisons, xp.sqrt, xp.maximum and xp.where on its array and number
+    arguments, and xp.take from the 1D arrays it names in tables: called as
+    plain numpy on numpy arrays, and on CuPy arrays as one CUDA kernel traced
+    from the same code. The kernel keeps numpy's order of operations and
+    fuses no multiply-adds, so it matches numpy bit for bit (cupy.fuse
+    contracts them, which moves a distorted pixel by a float32 step).
     """
-    kernels = {}
+    def wrap(fn):
+        names = list(inspect.signature(fn).parameters)[1:]
+        table_positions = {i for i, name in enumerate(names) if name in tables}
+        kernels = {}
 
-    @functools.wraps(fn)
-    def run(*args):
-        if array_module(args[0]) is np:
-            return fn(np, *args)
-        key = tuple(a.dtype.name if isinstance(a, cupy.ndarray) else 'float64' for a in args)
-        if key not in kernels:
-            kernels[key] = _Trace(fn, key).kernel()
-        return kernels[key](*args)
-    return run
+        @functools.wraps(fn)
+        def run(*args):
+            if array_module(args[0]) is np:
+                return fn(np, *args)
+            key = tuple(a.dtype.name if isinstance(a, cupy.ndarray)
+                        else 'int64' if isinstance(a, int) else 'float64' for a in args)
+            if key not in kernels:
+                kernels[key] = _Trace(fn, key, table_positions).kernel()
+            return kernels[key](*args)
+        return run
+    return wrap
 
 
 class _Trace:
     """Records fn(self, ...) as the statements of a CUDA elementwise kernel."""
 
-    _CTYPES = {'float64': 'double', 'float32': 'float', 'bool': 'bool'}
+    _CTYPES = {'float64': 'double', 'float32': 'float', 'int64': 'long long',
+               'bool': 'bool'}
 
-    def __init__(self, fn, dtypes):
-        self.fn, self.dtypes, self.lines = fn, dtypes, []
+    def __init__(self, fn, dtypes, table_positions):
+        self.fn, self.dtypes, self.tables, self.lines = fn, dtypes, table_positions, []
 
     def emit(self, ctype, expr):
         name = f't{len(self.lines)}'
@@ -130,13 +144,17 @@ class _Trace:
         ctype = _Traced.promote(a, b)
         return self.emit(ctype, f'{_Traced.c(cond)} ? ({ctype}){_Traced.c(a)} : ({ctype}){_Traced.c(b)}')
 
+    def take(self, table, index):
+        return self.emit(table.ctype, f'{table.name}[{_Traced.c(index)}]')
+
     def kernel(self):
         args = [_Traced(self, f'a{i}', self._CTYPES[d]) for i, d in enumerate(self.dtypes)]
         outs = self.fn(self, *args)
         outs = outs if isinstance(outs, tuple) else (outs,)
         dtype_of = {c: d for d, c in self._CTYPES.items()}
         return cupy.ElementwiseKernel(
-            ', '.join(f'{d} a{i}' for i, d in enumerate(self.dtypes)),
+            ', '.join(f'{"raw " if i in self.tables else ""}{d} a{i}'
+                      for i, d in enumerate(self.dtypes)),
             ', '.join(f'{dtype_of[o.ctype]} o{j}' for j, o in enumerate(outs)),
             '\n'.join(self.lines + [f'o{j} = {o.name};' for j, o in enumerate(outs)]),
             name=self.fn.__name__.strip('_'), options=('--fmad=false',))
@@ -150,12 +168,15 @@ class _Traced:
 
     @staticmethod
     def c(v):
-        return v.name if isinstance(v, _Traced) else repr(float(v))
+        if isinstance(v, _Traced):
+            return v.name
+        return repr(v) if isinstance(v, int) else repr(float(v))
 
     @staticmethod
     def promote(*vs):
-        types = {v.ctype if isinstance(v, _Traced) else 'double' for v in vs}
-        return next(t for t in ('double', 'float', 'bool') if t in types)
+        types = {v.ctype if isinstance(v, _Traced) else
+                 'long long' if isinstance(v, int) else 'double' for v in vs}
+        return next(t for t in ('double', 'float', 'long long', 'bool') if t in types)
 
     def _binary(self, other, op, reverse=False, ctype=None):
         a, b = (other, self) if reverse else (self, other)
@@ -1233,6 +1254,11 @@ def mei_forward(X, Y, Z, xi, K, D_or_lens=None, lens=None):
 
     Returns: u, v (pixel coords), valid (bool mask)
     """
+    return _mei_projection(X, Y, Z, *mei_coefficients(xi, K, D_or_lens, lens))
+
+
+def mei_coefficients(xi, K, D_or_lens=None, lens=None):
+    """mei_forward's parameters as floats, in the order _mei takes them."""
     # Use MEILensParams if provided, else legacy D array (no k4, no thin prism)
     if lens is not None or (isinstance(D_or_lens, MEILensParams)):
         L = lens if lens is not None else D_or_lens
@@ -1241,14 +1267,11 @@ def mei_forward(X, Y, Z, xi, K, D_or_lens=None, lens=None):
         D = D_or_lens
         coeffs = (D[0], D[1], D[4] if len(D) > 4 else 0.0, 0.0, D[2], D[3],
                   0.0, 0.0, 0.0, 0.0)
-    return _mei_project(X, Y, Z, float(xi), *map(float, coeffs),
-                        float(K[0, 0]), float(K[0, 2]), float(K[1, 1]), float(K[1, 2]))
+    return tuple(float(c) for c in (xi, *coeffs, K[0, 0], K[0, 2], K[1, 1], K[1, 2]))
 
 
-@fused
-def _mei_project(xp, X, Y, Z, xi, k1, k2, k3, k4, p1, p2, s1, s2, s3, s4,
-                 fx, cx, fy, cy):
-    """mei_forward on its coefficients, as one kernel on the GPU."""
+def _mei(xp, X, Y, Z, xi, k1, k2, k3, k4, p1, p2, s1, s2, s3, s4, fx, cx, fy, cy):
+    """mei_forward on its coefficients."""
     norm = xp.sqrt(X*X + Y*Y + Z*Z)
     norm = xp.maximum(norm, 1e-10)
     Xs, Ys, Zs = X/norm, Y/norm, Z/norm
@@ -1267,6 +1290,22 @@ def _mei_project(xp, X, Y, Z, xi, k1, k2, k3, k4, p1, p2, s1, s2, s3, s4,
     yd = y*radial + p1*(r2 + 2*y*y) + 2*p2*x*y + s3*r2 + s4*r4
 
     return fx * xd + cx, fy * yd + cy, valid
+
+
+_mei_projection = fused()(_mei)
+
+
+@fused()
+def _lens_pixels(xp, X, Y, Z, width, height, cos_max, *coefficients):
+    """
+    Fisheye pixels of lens-frame rays, valid when projected inside the sensor
+    and closer to the optical axis than the angle whose cosine is cos_max.
+    """
+    u, v, valid = _mei(xp, X, Y, Z, *coefficients)
+    valid = valid & (u >= 0) & (u < width - 1)
+    valid = valid & (v >= 0) & (v < height - 1)
+    cos_axis = Z / xp.maximum(xp.sqrt(X * X + Y * Y + Z * Z), 1e-12)
+    return u, v, valid & (cos_axis > cos_max)
 
 
 # ============================================================
@@ -1301,33 +1340,21 @@ def equirect_rays(eq_w, eq_h, xp=np):
                      (xp.cos(lat) * xp.cos(lon)).ravel()], axis=0)
 
 
-def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4):
+def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4, maps=None):
     """
     Resample an equirectangular image so that the output direction r shows the
     input's direction R @ r, at out_w x out_h (default: the input size); rays
-    are the output grid's equirect_rays, when already at hand. Lanczos,
-    wrapping round the ±180 deg meridian and across the poles; pad covers the
-    kernel's reach.
+    are the output grid's equirect_rays, and maps the equirect_rotation_maps,
+    when already at hand. Lanczos, wrapping round the ±180 deg meridian and
+    across the poles; pad covers the kernel's reach.
     """
     xp = array_module(image)
     h, w = image.shape[:2]
     out_w, out_h = out_w or w, out_h or h
-    if rays is None:
-        rays = equirect_rays(out_w, out_h, xp)
-    # The maps are computed where the rays live, the image resampled where it
-    # lives: float32 trigonometry rounds differently on the GPU, which moves a
-    # few edge pixels by 1/32 px, so CPU rays reproduce CPU maps exactly.
-    rp = array_module(rays)
-    M = rp.asarray(R.as_matrix().astype(rays.dtype))
-
-    def maps(rays, first, stop):
-        x, y, z = M @ rays
-        map_x = (rp.arctan2(x, z) + np.pi) / (2 * np.pi) * w + pad
-        map_y = (np.pi / 2 - rp.arcsin(rp.clip(-y, -1.0, 1.0))) / np.pi * h + pad
-        return (map_x.astype(rp.float32).reshape(stop - first, out_w),
-                map_y.astype(rp.float32).reshape(stop - first, out_w))
-
-    map_x, map_y = map_rows(maps, rays, out_w, out_h)
+    if maps is None:
+        if rays is None:
+            rays = equirect_rays(out_w, out_h, xp)
+        maps = equirect_rotation_maps(R, w, h, out_w, out_h, rays, pad)
 
     # Past the top pole (row 0), row -k is row k half a turn round. The bottom
     # pole would be row h: it takes the mean of the last row, and row h + k is
@@ -1341,7 +1368,28 @@ def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4):
         :, xp.asarray((cols + w // 2) % w)]
     padded[pad + h] = image[h - 1].mean(axis=0)
 
-    return remap_lanczos(padded, map_x, map_y, replicate=True)
+    return remap_lanczos(padded, *maps, replicate=True)
+
+
+def equirect_rotation_maps(R, w, h, out_w, out_h, rays, pad=4):
+    """
+    rotate_equirect's remap tables from a w x h image to the output grid
+    whose equirect_rays are rays, computed where the rays live. float32
+    trigonometry rounds differently on the GPU, which moves a few edge pixels
+    by 1/32 px: CPU rays reproduce the CPU's tables exactly, whichever device
+    then resamples.
+    """
+    xp = array_module(rays)
+    M = xp.asarray(R.as_matrix().astype(rays.dtype))
+
+    def maps(rays, first, stop):
+        x, y, z = M @ rays
+        map_x = (xp.arctan2(x, z) + np.pi) / (2 * np.pi) * w + pad
+        map_y = (np.pi / 2 - xp.arcsin(xp.clip(-y, -1.0, 1.0))) / np.pi * h + pad
+        return (map_x.astype(xp.float32).reshape(stop - first, out_w),
+                map_y.astype(xp.float32).reshape(stop - first, out_w))
+
+    return map_rows(maps, rays, out_w, out_h)
 
 
 def lens_max_angle(lens, samples=721):
@@ -1395,16 +1443,12 @@ def _project_rays(lens, rays, eq_w, eq_h, depth_map=None, max_angle=None):
         Yl = d * Yl + t_local[1]
         Zl = d * Zl + t_local[2]
 
-    u_src, v_src, valid = mei_forward(Xl, Yl, Zl, lens.xi, lens.K, lens=lens)
-
-    # Bounds check against sensor
-    valid = valid & (u_src >= 0) & (u_src < lens.width - 1)
-    valid = valid & (v_src >= 0) & (v_src < lens.height - 1)
-
-    # Field of view, tested on the ray angle: past the fold the pixel radius
-    # shrinks again, so a radius test alone accepts rays from behind the lens.
-    cos_axis = Zl / xp.maximum(xp.sqrt(Xl * Xl + Yl * Yl + Zl * Zl), 1e-12)
-    valid = valid & (cos_axis > np.cos(max_angle))
+    # Bounds check against sensor, and field of view tested on the ray angle:
+    # past the fold the pixel radius shrinks again, so a radius test alone
+    # accepts rays from behind the lens.
+    u_src, v_src, valid = _lens_pixels(
+        Xl, Yl, Zl, lens.width, lens.height, float(np.cos(max_angle)),
+        *mei_coefficients(lens.xi, lens.K, lens=lens))
 
     if lens.fov_deg is None:
         # No calibrated FOV: stay inside a margin of the image circle
@@ -1416,7 +1460,7 @@ def _project_rays(lens, rays, eq_w, eq_h, depth_map=None, max_angle=None):
     return u_src, v_src, valid
 
 
-def _rotate_rays_at(rs_rotations, fracs, rays, chunk=1 << 20):
+def _rotate_rays_at(rs_rotations, fracs, rays):
     """
     Rotate the rays (3, N) by the rotation at their readout fraction, a scalar
     or one per ray. Neighbouring keyframes differ by well under a tenth of a
@@ -1433,12 +1477,24 @@ def _rotate_rays_at(rs_rotations, fracs, rays, chunk=1 << 20):
     pos = xp.interp(fracs, xp.asarray(keys), xp.arange(len(keys), dtype=xp.float64))
     idx = xp.minimum(pos.astype(xp.int64), len(keys) - 2)
     alpha = pos - idx
-    out = xp.empty_like(rays)
-    for s in range(0, rays.shape[1], chunk):
-        i, a = idx[s:s + chunk], alpha[s:s + chunk, None, None]
-        M = (1.0 - a) * mats[i] + a * mats[i + 1]
-        out[:, s:s + chunk] = xp.einsum('nij,jn->in', M, rays[:, s:s + chunk])
-    return out
+    return xp.stack(_rotate_interpolated(idx, alpha, *rays, mats.ravel()))
+
+
+@fused(tables=('mats',))
+def _rotate_interpolated(xp, idx, alpha, X, Y, Z, mats):
+    """
+    Rays (X, Y, Z) turned by (1 - alpha) mats[idx] + alpha mats[idx + 1],
+    mats holding (n, 3, 3) matrices flattened, summed row by row as
+    einsum('nij,jn->in') does.
+    """
+    base = idx * 9
+
+    def turned(row):
+        m = [(1.0 - alpha) * xp.take(mats, base + (3 * row + j))
+             + alpha * xp.take(mats, base + (9 + 3 * row + j)) for j in range(3)]
+        return m[0] * X + m[1] * Y + m[2] * Z
+
+    return turned(0), turned(1), turned(2)
 
 
 def build_equirect_remap(lens, eq_w, eq_h, R_stabilization=None,
@@ -1804,6 +1860,12 @@ class X5Pipeline:
         t0 = time.time()
         xp = self.xp
 
+        # The output rotation's tables are computed on the CPU (see
+        # equirect_rotation_maps) while the frame is stitched.
+        R_out = self._seam_from_output(frame_num)
+        out_maps = _side_thread().submit(equirect_rotation_maps, R_out, self.st_w,
+                                         self.st_h, self.eq_w, self.eq_h, self.out_rays)
+
         if self.imu_orientation is not None:
             self._build_maps(frame_num)
 
@@ -1829,18 +1891,18 @@ class X5Pipeline:
         rows = overlap_rows(overlap_mask)
 
         if rows is not None:
-            band = slice(*rows)
-            w_front = self.w_front[band][:, :, np.newaxis]
-            w_back = self.w_back[band][:, :, np.newaxis]
+            seam = slice(*rows)
+            w_front = self.w_front[seam][:, :, np.newaxis]
+            w_back = self.w_back[seam][:, :, np.newaxis]
 
             # Color harmonization: SYMMETRIC correction at the seam.
             # Both lenses are adjusted toward their geometric mean in the overlap,
             # so neither side has an uncorrected color step at the transition.
             # The correction fades to zero away from the seam.
-            eq_front_f = eq_front[band].astype(xp.float32)
-            eq_back_f = eq_back[band].astype(xp.float32)
-            gain_field = compute_spatial_gain(eq_front[band], eq_back[band],
-                                              overlap_mask[band])
+            eq_front_f = eq_front[seam].astype(xp.float32)
+            eq_back_f = eq_back[seam].astype(xp.float32)
+            gain_field = compute_spatial_gain(eq_front[seam], eq_back[seam],
+                                              overlap_mask[seam])
             # gain = front/back. To meet in the middle:
             #   front_adj = front / sqrt(gain) = front * sqrt(back/front)
             #   back_adj  = back  * sqrt(gain) = back  * sqrt(front/back)
@@ -1856,13 +1918,13 @@ class X5Pipeline:
             eq_back_f = eq_back_f * (1.0 - correction_weight) + \
                         eq_back_f * sqrt_gain * correction_weight
 
-            eq_front[band] = xp.clip(eq_front_f, 0, 255).astype(xp.uint8)
-            eq_back[band] = xp.clip(eq_back_f, 0, 255).astype(xp.uint8)
+            eq_front[seam] = xp.clip(eq_front_f, 0, 255).astype(xp.uint8)
+            eq_back[seam] = xp.clip(eq_back_f, 0, 255).astype(xp.uint8)
 
             # Base canvas: smooth weighted blend
-            result[band] = xp.clip(
-                eq_front[band].astype(xp.float32) * w_front +
-                eq_back[band].astype(xp.float32) * w_back,
+            result[seam] = xp.clip(
+                eq_front[seam].astype(xp.float32) * w_front +
+                eq_back[seam].astype(xp.float32) * w_back,
                 0, 255).astype(xp.uint8)
 
         if self.enable_flow and rows is not None:
@@ -1889,8 +1951,8 @@ class X5Pipeline:
                                         0, 255).astype(xp.uint8)
 
         # Turn the stitch from the seam frame to the output
-        result = to_numpy(rotate_equirect(result, self._seam_from_output(frame_num),
-                                          self.eq_w, self.eq_h, self.out_rays))
+        result = to_numpy(rotate_equirect(result, R_out, self.eq_w, self.eq_h,
+                                          maps=out_maps.result()))
 
         # Optional edge-preserving denoise (bilateral filter)
         if self.denoise:
