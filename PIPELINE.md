@@ -259,8 +259,9 @@ aligned band by up to 243 levels. Each GPU stage reproduces its CPU counterpart:
 | Bilinear remap (flow warp) | CUDA kernel with OpenCV 5's float interpolation and fused multiply-adds |
 | Gaussian blur of the color gain | CUDA kernel accumulating as OpenCV's SIMD code does: fused multiply-adds up to the last multiple of 8 columns, plain sums after |
 | MEI projection, validity, rolling shutter rotation | kernels traced from the numpy code itself (`fused`), in numpy's order of operations and without multiply-add contraction; `cupy.fuse` contracts them, and the strongly cancelling X6 polynomial turns that into float32 steps |
-| Output rotation tables | on the CPU, on a side thread: float32 arctan2 and arcsin round differently on the GPU |
-| Distance transform, DIS flow, flow resizing | on the CPU |
+| Rotations of the rays (3×3 matrix products) | inside the same kernels, as OpenBLAS computes numpy's products: `fma(m2, z, fma(m1, y, m0·x))` per row, identical on 50 million values |
+| Output rotation tables | on the CPU, in four row blocks on a side thread: float32 arctan2 and arcsin round differently on the GPU. Four blocks take 82 ms and 0.28 CPU-seconds per frame, 24 blocks 71 ms and 0.44 |
+| Distance transform, DIS flow, flow resizing | on the CPU, DIS flow on a thread of its own |
 
 **CPU shortcuts, all exact.** Map building runs in row blocks across a thread pool. Blend
 weights, distance transforms and the color gain only touch the rows holding overlap:
@@ -269,7 +270,19 @@ those rows, and falls back to the whole image when a distance reaches the strip'
 (a 5×5 chamfer distance is at least the row offset). The seam-frame rays are cached.
 
 **Video.** The reader seeks on the input side (frame 1388 in 0.8 s instead of 52 s, the
-same frames); decoding and encoding run on their own threads.
+same frames); decoding and encoding run on their own threads. Each frame is stitched in
+two halves: `_begin_frame` stitches up to the parallax band and leaves DIS flow computing
+on the CPU, and the function it returns warps the band, turns the stitch to the output and
+downloads it. `stitch_frames` begins frame n before finishing frame n − 1, so the GPU
+stitches while the CPU computes the flow; it yields the same images as `stitch_frame`.
+
+Decoded frames come through a 64 MB pipe on Windows. The default pipe buffer split each
+3840×3840 frame into 1350 reads, each taking the GIL back: reading a pair of frames took
+110 ms alone and 230 ms during a render, against 56 ms and 55 ms through the larger pipe.
+
+X6 clip, 3840 output stitched at 5760, RTX 5090 Laptop: 0.25 s per frame stitched alone,
+0.21 s per frame of video over 300 frames (decoding and x264 encoding included), with the
+Python process on 7.4 cores and x264 on 3.5.
 
 `tests/test_backend.py` checks each equivalence. Five reference renders of an X6 clip
 (two frames, with and without flow, without stabilization, stitched at 3840) are identical

@@ -254,15 +254,16 @@ def _launch(kernel, n, *args):
     kernel(((n + 255) // 256,), (256,), args)
 
 
-def map_rows(fn, rays, eq_w, eq_h, min_rows=32):
+def map_rows(fn, rays, eq_w, eq_h, min_rows=32, blocks=None):
     """
     fn(rays, first, stop) -> tuple of (stop - first, eq_w) arrays, for the
     rays (3, eq_h * eq_w) of a grid's rows first:stop, over the whole grid: in
-    one call on the GPU, in row blocks across the thread pool on the CPU.
+    one call on the GPU, in row blocks across the thread pool on the CPU, as
+    many blocks as there are CPUs unless given.
     """
     if array_module(rays) is not np:
         return fn(rays, 0, eq_h)
-    n = max(1, min(os.cpu_count(), eq_h // min_rows))
+    n = max(1, min(blocks or os.cpu_count(), eq_h // min_rows))
     bounds = np.linspace(0, eq_h, n + 1).astype(int).tolist()
     parts = parallel_map(
         lambda first, stop: fn(np.ascontiguousarray(rays[:, first * eq_w:stop * eq_w]),
@@ -1161,6 +1162,35 @@ def decode_frame(insv_path, frame_num, track, width, height):
     return np.frombuffer(r.stdout, dtype=np.uint8).reshape(height, width, 3).copy()
 
 
+# Decoded frames are tens of megabytes. Windows gives subprocess pipes a
+# buffer of a few tens of kilobytes: a 3840x3840 frame then takes 1350 reads
+# holding the GIL in turn, 110 ms per pair of frames against 56 ms through a
+# 64 MB pipe.
+PIPE_BUFFER = 64 << 20
+
+
+def popen_with_stdout_pipe(cmd):
+    """
+    Popen(cmd) writing to a pipe of PIPE_BUFFER bytes where the OS lets the
+    size be chosen (Windows); returns the process and the unbuffered binary
+    file reading that pipe.
+    """
+    if os.name != 'nt':
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=0)
+        return proc, proc.stdout
+    import _winapi
+    import msvcrt
+    read_handle, write_handle = _winapi.CreatePipe(None, PIPE_BUFFER)
+    write_fd = msvcrt.open_osfhandle(write_handle, 0)
+    try:
+        # Popen hands the child an inheritable duplicate of the write end.
+        proc = subprocess.Popen(cmd, stdout=write_fd, stderr=subprocess.DEVNULL)
+    finally:
+        os.close(write_fd)
+    return proc, open(msvcrt.open_osfhandle(read_handle, os.O_RDONLY), 'rb', buffering=0)
+
+
 class InsvFrameReader:
     """
     Sequential dual-track frame reader.
@@ -1180,7 +1210,7 @@ class InsvFrameReader:
         self.height = height
         self.frame_size = width * height * 3
         self.next_index = start_frame
-        self.procs = []
+        self.procs, self.pipes = [], []
         for track in (0, 1):
             cmd = ['ffmpeg', '-loglevel', 'error']
             if start_frame > 0:
@@ -1194,16 +1224,16 @@ class InsvFrameReader:
             # one and shift every later frame by a whole frame against the IMU.
             cmd += ['-fps_mode', 'passthrough',
                     '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
-            self.procs.append(subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                bufsize=0))
+            proc, pipe = popen_with_stdout_pipe(cmd)
+            self.procs.append(proc)
+            self.pipes.append(pipe)
 
-    def _read_one(self, proc):
+    def _read_one(self, pipe):
         buf = bytearray(self.frame_size)
         view = memoryview(buf)
         got = 0
         while got < self.frame_size:
-            n = proc.stdout.readinto(view[got:])
+            n = pipe.readinto(view[got:])
             if not n:
                 return None
             got += n
@@ -1212,17 +1242,17 @@ class InsvFrameReader:
 
     def read(self):
         """Return the next (front, back) pair, or None at end of stream."""
-        front = self._read_one(self.procs[0])
-        back = self._read_one(self.procs[1])
+        front = self._read_one(self.pipes[0])
+        back = self._read_one(self.pipes[1])
         if front is None or back is None:
             return None
         self.next_index += 1
         return front, back
 
     def close(self):
-        for proc in self.procs:
+        for proc, pipe in zip(self.procs, self.pipes):
             try:
-                proc.stdout.close()
+                pipe.close()
             except Exception:
                 pass
             try:
@@ -1230,7 +1260,7 @@ class InsvFrameReader:
                 proc.wait(timeout=5)
             except Exception:
                 pass
-        self.procs = []
+        self.procs, self.pipes = [], []
 
     def __enter__(self):
         return self
@@ -1424,13 +1454,13 @@ def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4, maps=Non
     return remap_lanczos(padded, *maps, replicate=True)
 
 
-def equirect_rotation_maps(R, w, h, out_w, out_h, rays, pad=4):
+def equirect_rotation_maps(R, w, h, out_w, out_h, rays, pad=4, blocks=None):
     """
     rotate_equirect's remap tables from a w x h image to the output grid
     whose equirect_rays are rays, computed where the rays live. float32
     trigonometry rounds differently on the GPU, which moves a few edge pixels
     by 1/32 px: CPU rays reproduce the CPU's tables exactly, whichever device
-    then resamples.
+    then resamples. blocks: CPU row blocks, as for map_rows.
     """
     xp = array_module(rays)
     M = xp.asarray(R.as_matrix().astype(rays.dtype))
@@ -1442,7 +1472,7 @@ def equirect_rotation_maps(R, w, h, out_w, out_h, rays, pad=4):
         return (map_x.astype(xp.float32).reshape(stop - first, out_w),
                 map_y.astype(xp.float32).reshape(stop - first, out_w))
 
-    return map_rows(maps, rays, out_w, out_h)
+    return map_rows(maps, rays, out_w, out_h, blocks=blocks)
 
 
 def lens_max_angle(lens, samples=721):
@@ -1948,11 +1978,14 @@ class X5Pipeline:
         xp = self.xp
 
         # The output rotation's tables are computed on the CPU (see
-        # equirect_rotation_maps) while the frame is stitched.
+        # equirect_rotation_maps) while the frame is stitched. Four blocks
+        # take 82 ms and 0.28 CPU-seconds at 3840 px, all 24 CPUs 71 ms and
+        # 0.44: the stitch never waits for them, but decoding and the flow
+        # do share the CPU.
         R_out = self._seam_from_output(frame_num)
         out_maps = _side_thread('rotation').submit(
             equirect_rotation_maps, R_out, self.st_w, self.st_h,
-            self.eq_w, self.eq_h, self.out_rays)
+            self.eq_w, self.eq_h, self.out_rays, blocks=4)
 
         if self.imu_orientation is not None:
             self._build_maps(frame_num)

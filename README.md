@@ -74,8 +74,10 @@ X6 clip, 3840 output stitched at 5760, stabilization and flow on, Core Ultra 9 2
 |---|---|
 | Before GPU support (CPU) | 24 |
 | CPU | 6.7 |
-| GPU, one frame | 0.35 |
-| GPU, video (decode and encode included) | 0.39 |
+| GPU, one frame | 0.25 |
+| GPU, video (300 frames, decode and encode included) | 0.21 |
+
+A video frame takes less than a single frame: each one begins on the GPU while the CPU computes the previous one's DIS flow.
 
 The CPU and the GPU both render the image the pipeline rendered before GPU support, bit for bit. DIS flow needs it: a one-level change of its input moves the flow by tens of pixels. See "Compute Backend" in `PIPELINE.md`.
 
