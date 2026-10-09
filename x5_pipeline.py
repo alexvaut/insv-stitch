@@ -16,10 +16,11 @@ import time
 import re
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 import functools
 import inspect
+import logging
 from functools import cache
 from pathlib import Path
 from string import Template
@@ -33,6 +34,9 @@ try:
     import cupy
 except ImportError:  # CPU only: pip install -e .[gpu] for the GPU
     cupy = None
+
+# Progress goes to this logger; the command line shows its INFO messages.
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -597,6 +601,7 @@ class ImuOrientation:
     motion: Slerp             # C(t): world-fixed directions, camera(ts[0]) -> camera(t)
     down: np.ndarray          # (n, 3) unit gravity direction in the camera frame
     heading: np.ndarray       # (n,) turn about down (rad) smoothing the heading
+    camera_heading: np.ndarray = None  # (n,) see camera_heading(); zeros without gyro fusion
 
     def motion_at(self, t):
         return self.motion(np.clip(t, self.ts[0], self.ts[-1]))
@@ -606,11 +611,17 @@ class ImuOrientation:
                      axis=-1)
         return d / np.linalg.norm(d, axis=-1, keepdims=True)
 
-    def leveling_at(self, t):
-        """Camera-from-output rotation: level horizon, smoothed heading."""
+    def leveling_at(self, t, turn=None):
+        """
+        Camera-from-output rotation: level horizon, turned about gravity by
+        turn (rad, one per time), by default the turn giving the smoothed
+        heading. Turning by +a equals a yaw of +a about the output's +Y: the
+        output looks a to the right.
+        """
         d = self.down_at(t)
-        turn = np.asarray(np.interp(t, self.ts, self.heading))[..., None]
-        return Rotation.from_rotvec(d * turn) * leveling_rotation(d)
+        if turn is None:
+            turn = np.interp(t, self.ts, self.heading)
+        return Rotation.from_rotvec(d * np.asarray(turn)[..., None]) * leveling_rotation(d)
 
 
 @dataclass
@@ -624,6 +635,12 @@ class PipelineMetadata:
     height: int
     offset: list
     imu_calib: ImuCalibration = None  # resolved from the camera model
+    # Telemetry blocks: Default.Metadata, per-frame exposure ({t: s of video
+    # time, v: exposure s}), Default.AAAData ({t: camera clock ms, v: {exp_time
+    # ms, iso_value, ...}})
+    metadata: dict = field(default_factory=dict)
+    exposure: list = field(default_factory=list)
+    aaa_data: list = field(default_factory=list)
 
 
 # ============================================================
@@ -640,6 +657,19 @@ def _find_pb_path(insv_path: str) -> str | None:
     if pb_path.exists():
         return str(pb_path)
     return None
+
+
+def find_lrv_path(insv_path: str) -> str | None:
+    """
+    The .lrv preview recorded with an .insv, in the same folder:
+    VID_<date>_<time>_00_<n>.insv goes with LRV_<date>_<time>_01_<n>.lrv.
+    """
+    insv = Path(insv_path)
+    match = re.fullmatch(r'VID_(.+)_00_(\d+)\.insv', insv.name, re.IGNORECASE)
+    if not match:
+        return None
+    lrv = insv.with_name(f'LRV_{match.group(1)}_01_{match.group(2)}.lrv')
+    return str(lrv) if lrv.exists() else None
 
 
 # Every .insv ends with this ASCII magic, preceded by the trailer size.
@@ -737,6 +767,22 @@ def _sensor_to_video(fx, fy, cx, cy, sensor_w, crop_dst, video_w):
     return fx_v, fy_v, cx_v, cy_v
 
 
+def lens_at_size(lens, width, height):
+    """
+    The lens seen through a fisheye image of width x height pixels: the same
+    optics, focal lengths scaled with the image and the principal point with
+    pixel centres aligned. On an X6 .lrv preview, aligning the pixel centres
+    brings its stitch 0.6 to 0.9 dB closer to the .insv stitch than scaling
+    the principal point alone.
+    """
+    if (width, height) == (lens.width, lens.height):
+        return lens
+    sx, sy = width / lens.width, height / lens.height
+    return replace(lens, fx=lens.fx * sx, fy=lens.fy * sy,
+                   cx=(lens.cx + 0.5) * sx - 0.5, cy=(lens.cy + 0.5) * sy - 0.5,
+                   width=width, height=height)
+
+
 def extract_metadata(insv_path: str) -> PipelineMetadata:
     """
     Extract all metadata from .insv file.
@@ -752,6 +798,10 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
     lens_data = item.get('Lens', {}).get('Data', {})
     dim = meta['dimension']
     width, height = dim['x'], dim['y']
+    # An .lrv preview holds both fisheyes side by side in one stream, and its
+    # trailer gives the dimension of that pair: each lens is half its width.
+    if width == 2 * height:
+        width = height
     offset = meta['offset']
 
     # Extended calibration: .pb sidecar (X5) first, then the .insv trailer (X6).
@@ -822,10 +872,10 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
             )
             lenses.append(lens)
 
-        print(f"  Using extended calibration from {calib_source} "
-              f"(13 coefficients per lens, xi={lenses[0].xi:.5f}, "
-              f"sensor {sensor_w:.0f}->{crop_dst:.0f}->{width}"
-              f"{', roll applied' if apply_roll else ''})")
+        log.info(f"  Using extended calibration from {calib_source} "
+                 f"(13 coefficients per lens, xi={lenses[0].xi:.5f}, "
+                 f"sensor {sensor_w:.0f}->{crop_dst:.0f}->{width}"
+                 f"{', roll applied' if apply_roll else ''})")
     else:
         # ---- Fallback: Gyroflow / offset_v3 (5-coeff model) ----
         if not lens_data or not offset:
@@ -870,7 +920,7 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
             R_extrinsic=R1, width=width, height=height,
         )
         lenses = [lens_front, lens_back]
-        print(f"  Using Gyroflow/offset_v3 calibration (5 coefficients)")
+        log.info("  Using Gyroflow/offset_v3 calibration (5 coefficients)")
 
     imu_samples = tp.normalized_imu()
     # The X5 reports this under Lens.Data; the X6 only has Default.Metadata.
@@ -902,13 +952,13 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
     camera_type = meta.get('camera_type', '')
     imu_calib = IMU_CALIBRATION_BY_CAMERA.get(camera_type)
     if imu_calib is None:
-        print(f"  WARNING: no IMU calibration for {camera_type!r}, falling back "
-              "to the X5 one. Stabilization will be wrong; use --no-stab or "
-              "re-solve against a Studio render.")
+        log.warning(f"No IMU calibration for {camera_type!r}, falling back "
+                    "to the X5 one. Stabilization will be wrong; use --no-stab or "
+                    "re-solve against a Studio render.")
         imu_calib = IMU_CALIBRATION_BY_CAMERA['Insta360 X5']
     elif not imu_calib.fuse_gyro:
-        print(f"  WARNING: the {camera_type} gyro axes are unverified; leveling "
-              "uses the accelerometer alone.")
+        log.warning(f"The {camera_type} gyro axes are unverified; leveling "
+                    "uses the accelerometer alone.")
 
     return PipelineMetadata(
         lens_params=lenses,
@@ -917,6 +967,9 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
         frame_readout_time=frame_readout_time,
         width=width, height=height, offset=offset,
         imu_calib=imu_calib,
+        metadata=meta,
+        exposure=item.get('Exposure', {}).get('Data') or [],
+        aaa_data=item['Default'].get('AAAData') or [],
     )
 
 
@@ -980,13 +1033,14 @@ IMU_TO_CAM_X6 = np.array([
 IMU_CALIBRATION_BY_CAMERA = {
     'Insta360 X5': ImuCalibration(_FLIP_XZ @ IMU_TO_CAM, accel_sign=1.0,
                                   fuse_gyro=False),
-    # X6 time offset, with each pixel timed by its sensor row. On a bumpy ridden
-    # stretch, this single value steadies both a field seen near the top of
-    # the front sensor and a house near the bottom of the back one; 2 ms
-    # earlier or later is rougher on one of them. Aligning whole consecutive
-    # frames against the gyro, which mixes all rows, put it 4 to 6 ms earlier.
+    # X6 time offset, with each pixel timed by its sensor row. Over frames
+    # 1088-1640 of 093459, a bumpy ridden stretch, 0 ms brings the 5-15 Hz
+    # vertical shake of the fields seen by the front lens down to that of an
+    # Insta360 Studio FlowState render (0.016 deg, Studio 0.015), and 1 ms
+    # doubles it. On two other ridden clips (083137, 084128) the least shake
+    # lies between -1 and +0.5 ms.
     'Insta360 X6': ImuCalibration(IMU_TO_CAM_X6, accel_sign=-1.0,
-                                  time_offset=0.001),
+                                  time_offset=0.0),
 }
 
 
@@ -1037,10 +1091,12 @@ def _ema(x, alpha):
     return lfilter([alpha], [1.0, alpha - 1.0], x, axis=0)
 
 
-def _heading_correction(motion, down, sigma_samples):
+def camera_heading(motion, down):
     """
-    Turn about gravity (rad), per sample, that makes the levelled output's
-    heading follow a Gaussian-smoothed version of the camera's.
+    Heading (rad, unwrapped), per sample, of the levelled output's forward
+    direction about the mean gravity of the world-fixed frame; its origin is
+    arbitrary. Turning the output about gravity by target - heading (see
+    ImuOrientation.leveling_at) makes it look along the target heading.
     """
     forward = motion.inv().apply(leveling_rotation(down).apply([0.0, 0.0, 1.0]))
     gravity = motion.inv().apply(down).mean(axis=0)
@@ -1048,7 +1104,14 @@ def _heading_correction(motion, down, sigma_samples):
     e1 = np.cross(gravity, np.eye(3)[np.argmin(np.abs(gravity))])
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(gravity, e1)
-    heading = np.unwrap(np.arctan2(forward @ e2, forward @ e1))
+    return np.unwrap(np.arctan2(forward @ e2, forward @ e1))
+
+
+def _heading_correction(heading, sigma_samples):
+    """
+    Turn about gravity (rad), per sample, that makes the levelled output's
+    heading follow a Gaussian-smoothed version of the camera's.
+    """
     return gaussian_filter1d(heading, sigma_samples, mode='nearest') - heading
 
 
@@ -1101,12 +1164,13 @@ def compute_stabilization_from_imu(imu_samples, calib, tau=16.0,
     if calib.fuse_gyro:
         smooth = motion.apply(smooth)
     down = smooth / np.linalg.norm(smooth, axis=1, keepdims=True)
+    raw_heading = camera_heading(motion, down) if calib.fuse_gyro else np.zeros(len(ts))
     if calib.fuse_gyro and heading_sigma:
-        heading = _heading_correction(motion, down, heading_sigma * rate)
+        heading = _heading_correction(raw_heading, heading_sigma * rate)
     else:
         heading = np.zeros(len(ts))
     return ImuOrientation(ts=ts, motion=Slerp(ts, motion), down=down,
-                          heading=heading)
+                          heading=heading, camera_heading=raw_heading)
 
 
 def compute_rs_rotations(orientation, frame_num, fps, readout_time_ms,
@@ -1191,39 +1255,48 @@ def popen_with_stdout_pipe(cmd):
     return proc, open(msvcrt.open_osfhandle(read_handle, os.O_RDONLY), 'rb', buffering=0)
 
 
-class InsvFrameReader:
+def decode_command(path, stream, fps, start_frame=0):
     """
-    Sequential dual-track frame reader.
+    ffmpeg command writing one video stream (an ffmpeg -map specifier) as raw
+    BGR frames to stdout, from start_frame on.
+    """
+    cmd = ['ffmpeg', '-loglevel', 'error']
+    if start_frame > 0:
+        # Input-side seek: ffmpeg jumps to the keyframe before, then
+        # decodes and discards up to the target, frame-accurately.
+        # Half a frame early, so rounding never lands on a neighbour.
+        cmd += ['-ss', f'{(start_frame - 0.5) / float(fps):.6f}']
+    cmd += ['-i', path, '-map', stream]
+    # Never duplicate or drop frames to keep a constant rate: after a
+    # seek between two frames, ffmpeg would otherwise repeat the first
+    # one and shift every later frame by a whole frame against the IMU.
+    return cmd + ['-fps_mode', 'passthrough',
+                  '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
 
-    decode_frame() above spawns one ffmpeg per frame and uses select=eq(n,N)
-    with no seek, so every request re-decodes from frame 0. Measured on an X6
-    clip: 1.04s for frame 0 but 6.02s for frame 150, i.e. quadratic cost over
-    a whole video. Here one ffmpeg process per track stays open and frames are
-    read in order, which measured 0.039s per frame for both tracks.
 
-    Tracks are read from two processes because a single ffmpeg cannot write
-    two rawvideo streams to one pipe.
+def video_size(path):
+    """(width, height) of the first video stream of a file."""
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+           '-show_entries', 'stream=width,height', '-of', 'csv=p=0', path]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    parts = [p for p in r.stdout.strip().split(',') if p]
+    return int(parts[0]), int(parts[1])
+
+
+class _PipeFrameReader:
+    """
+    Frames of one shape read in order from decoding processes, one per
+    command, which stay open: reading on costs a frame's decode, where
+    decode_frame() above re-decodes from frame 0 on every call (1.04 s for
+    frame 0, 6.02 s for frame 150 on an X6 clip).
     """
 
-    def __init__(self, insv_path, width, height, fps, start_frame=0):
-        self.width = width
-        self.height = height
-        self.frame_size = width * height * 3
+    def __init__(self, commands, shape, start_frame):
+        self.shape = shape
+        self.frame_size = int(np.prod(shape))
         self.next_index = start_frame
         self.procs, self.pipes = [], []
-        for track in (0, 1):
-            cmd = ['ffmpeg', '-loglevel', 'error']
-            if start_frame > 0:
-                # Input-side seek: ffmpeg jumps to the keyframe before, then
-                # decodes and discards up to the target, frame-accurately.
-                # Half a frame early, so rounding never lands on a neighbour.
-                cmd += ['-ss', f'{(start_frame - 0.5) / float(fps):.6f}']
-            cmd += ['-i', insv_path, '-map', f'0:{track}']
-            # Never duplicate or drop frames to keep a constant rate: after a
-            # seek between two frames, ffmpeg would otherwise repeat the first
-            # one and shift every later frame by a whole frame against the IMU.
-            cmd += ['-fps_mode', 'passthrough',
-                    '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
+        for cmd in commands:
             proc, pipe = popen_with_stdout_pipe(cmd)
             self.procs.append(proc)
             self.pipes.append(pipe)
@@ -1237,17 +1310,7 @@ class InsvFrameReader:
             if not n:
                 return None
             got += n
-        return np.frombuffer(buf, dtype=np.uint8).reshape(
-            self.height, self.width, 3)
-
-    def read(self):
-        """Return the next (front, back) pair, or None at end of stream."""
-        front = self._read_one(self.pipes[0])
-        back = self._read_one(self.pipes[1])
-        if front is None or back is None:
-            return None
-        self.next_index += 1
-        return front, back
+        return np.frombuffer(buf, dtype=np.uint8).reshape(self.shape)
 
     def close(self):
         for proc, pipe in zip(self.procs, self.pipes):
@@ -1267,6 +1330,70 @@ class InsvFrameReader:
 
     def __exit__(self, *exc):
         self.close()
+
+
+class InsvFrameReader(_PipeFrameReader):
+    """
+    Front and back fisheyes of an .insv, tracks 0 and 1, read in order: 0.039 s
+    per pair at 3840 px. Tracks are read from two processes because a single
+    ffmpeg cannot write two rawvideo streams to one pipe.
+    """
+
+    def __init__(self, insv_path, width, height, fps, start_frame=0):
+        super().__init__([decode_command(insv_path, f'0:{track}', fps, start_frame)
+                          for track in (0, 1)], (height, width, 3), start_frame)
+
+    def read(self):
+        """Return the next (front, back) pair, or None at end of stream."""
+        front = self._read_one(self.pipes[0])
+        back = self._read_one(self.pipes[1])
+        if front is None or back is None:
+            return None
+        self.next_index += 1
+        return front, back
+
+
+class LrvFrameReader(_PipeFrameReader):
+    """
+    Front and back fisheyes of an .lrv preview, read in order. The preview
+    holds both fisheyes side by side in one stream, each width x height: the
+    front lens (.insv track 0) on the right, the back lens on the left, with
+    the .insv's frame count and timing.
+    """
+
+    def __init__(self, lrv_path, width, height, fps, start_frame=0):
+        self.width = width
+        super().__init__([decode_command(lrv_path, '0:v:0', fps, start_frame)],
+                         (height, 2 * width, 3), start_frame)
+
+    def read(self):
+        """Return the next (front, back) pair, or None at end of stream."""
+        frame = self._read_one(self.pipes[0])
+        if frame is None:
+            return None
+        self.next_index += 1
+        return (np.ascontiguousarray(frame[:, self.width:]),
+                np.ascontiguousarray(frame[:, :self.width]))
+
+
+def lrv_fisheye_size(lrv_path):
+    """(width, height) of each fisheye of an .lrv preview."""
+    width, height = video_size(lrv_path)
+    return width // 2, height
+
+
+def h264_command(width, height, fps, output_path, crf=18, inputs=(), output_args=()):
+    """
+    ffmpeg command encoding raw BGR frames of width x height read on stdin
+    (input 0) to H.264, with further inputs and output arguments (streams,
+    filters, audio codec) placed before the video codec.
+    """
+    return ['ffmpeg', '-y', '-loglevel', 'warning',
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}', '-r', str(fps), '-i', 'pipe:0',
+            *inputs, *output_args,
+            '-c:v', 'libx264', '-preset', 'medium',
+            '-crf', str(crf), '-pix_fmt', 'yuv420p', output_path]
 
 
 def read_ahead(read, count, depth=2):
@@ -1421,6 +1548,23 @@ def equirect_rays(eq_w, eq_h, xp=np):
     return xp.stack([(xp.cos(lat) * xp.sin(lon)).ravel(),
                      (-xp.sin(lat)).ravel(),   # Y-down camera convention
                      (xp.cos(lat) * xp.cos(lon)).ravel()], axis=0)
+
+
+@dataclass
+class RayGrid:
+    """
+    Output pixels as unit rays (3, height * width) in row order, in the output
+    frame (X right, Y down, Z forward), float32 on the CPU: CPU trigonometry
+    gives the same output tables whichever device resamples (see
+    equirect_rotation_maps). Every ray must be a finite unit vector.
+    """
+    rays: np.ndarray
+    width: int
+    height: int
+
+    @classmethod
+    def equirect(cls, width, height):
+        return cls(equirect_rays(width, height).astype(np.float32), width, height)
 
 
 def rotate_equirect(image, R, out_w=None, out_h=None, rays=None, pad=4, maps=None):
@@ -1823,7 +1967,15 @@ class X5Pipeline:
 
     def __init__(self, insv_path, eq_width=3840,
                  enable_stabilization=True, enable_flow=True,
-                 denoise=False, stitch_width=None, device='auto'):
+                 denoise=False, stitch_width=None, device='auto',
+                 frame_source='insv', meta=None, imu_orientation=None):
+        """
+        frame_source: 'insv' stitches the recorded fisheyes, 'lrv' the .lrv
+            preview recorded alongside, with the same calibration scaled.
+        meta, imu_orientation: the extract_metadata and
+            compute_stabilization_from_imu results for insv_path when already
+            at hand, computed otherwise.
+        """
         self.insv_path = insv_path
         self.xp = resolve_device(device)
         self.eq_w = eq_width
@@ -1838,33 +1990,48 @@ class X5Pipeline:
         # Output directions, turned into the seam frame after each stitch
         # (on the CPU, see rotate_equirect), and seam-frame directions, for
         # the remap tables
-        self.out_rays = equirect_rays(self.eq_w, self.eq_h).astype(np.float32)
+        self.out_grid = RayGrid.equirect(self.eq_w, self.eq_h)
         self.st_rays = equirect_rays(self.st_w, self.st_h, self.xp)
         self.enable_stabilization = enable_stabilization
         self.enable_flow = enable_flow
         self.denoise = denoise
 
-        print("[1/4] Extracting metadata...")
-        self.meta = extract_metadata(insv_path)
-        print(f"  Video: {self.meta.width}x{self.meta.height} @ "
-              f"{self.meta.fps}fps, {self.meta.frame_count} frames")
+        log.info("[1/4] Extracting metadata...")
+        self.meta = meta or extract_metadata(insv_path)
+        log.info(f"  Video: {self.meta.width}x{self.meta.height} @ "
+                 f"{self.meta.fps}fps, {self.meta.frame_count} frames")
+
+        # The fisheye frames, and the lenses at their size
+        if frame_source == 'insv':
+            self.frame_path, self.frame_reader = insv_path, InsvFrameReader
+            self.frame_w, self.frame_h = self.meta.width, self.meta.height
+        elif frame_source == 'lrv':
+            self.frame_path, self.frame_reader = find_lrv_path(insv_path), LrvFrameReader
+            if self.frame_path is None:
+                raise FileNotFoundError(f"No .lrv preview recorded with {insv_path}")
+            self.frame_w, self.frame_h = lrv_fisheye_size(self.frame_path)
+        else:
+            raise ValueError(f"frame_source must be 'insv' or 'lrv', not {frame_source!r}")
+        self.lenses = [lens_at_size(lens, self.frame_w, self.frame_h)
+                       for lens in self.meta.lens_params]
 
         # Rolling shutter needs the gyro even when leveling is off.
-        print("[2/4] Computing IMU orientation...")
-        self.imu_orientation = compute_stabilization_from_imu(
+        log.info("[2/4] Computing IMU orientation...")
+        self.imu_orientation = imu_orientation or compute_stabilization_from_imu(
             self.meta.imu_samples, self.meta.imu_calib)
         if self.imu_orientation is None:
-            print("  No IMU data: no stabilization, no rolling shutter correction")
+            log.info("  No IMU data: no stabilization, no rolling shutter correction")
 
-        print("[3/4] Building remap tables...")
+        log.info("[3/4] Building remap tables...")
         self._build_maps(frame_idx=0)
 
         if enable_flow:
             self.flow_engine = FlowEngine()
 
-        print("[4/4] Ready.")
-        print(f"  Output: {self.eq_w}x{self.eq_h}, stitched at {self.st_w}x{self.st_h} "
-              f"on the {'CPU' if self.xp is np else 'GPU'}")
+        log.info("[4/4] Ready.")
+        log.info(f"  Output: {self.eq_w}x{self.eq_h}, stitched at {self.st_w}x{self.st_h} "
+                 f"from {self.frame_w}x{self.frame_h} fisheyes "
+                 f"on the {'CPU' if self.xp is np else 'GPU'}")
 
     def _build_maps(self, frame_idx=0, depth_map=None):
         """Seam-frame remap tables with rolling shutter correction."""
@@ -1877,7 +2044,7 @@ class X5Pipeline:
             rs_rots = [(f, R * CAMERA_FROM_SEAM) for f, R in rs_rots]
 
         self.maps = []
-        for lens in self.meta.lens_params:
+        for lens in self.lenses:
             mx, my, valid = build_equirect_remap(
                 lens, self.st_w, self.st_h, R_stabilization=CAMERA_FROM_SEAM,
                 rs_rotations=rs_rots, depth_map=depth_map, rays=self.st_rays)
@@ -1886,9 +2053,16 @@ class X5Pipeline:
         self.w_front, self.w_back = compute_blend_weights(
             self.maps[0][2], self.maps[1][2], self.st_w, self.st_h)
 
-    def _seam_from_output(self, frame_num):
-        """Rotation taking output directions into the seam frame."""
+    def _seam_from_output(self, frame_num, cam_from_output=None):
+        """
+        Rotation taking output directions into the seam frame, through a
+        camera-from-output rotation for the frame: cam_from_output when
+        given, else the IMU leveling (level horizon, smoothed heading), else
+        the camera itself.
+        """
         R = CAMERA_FROM_SEAM.inv()
+        if cam_from_output is not None:
+            return R * cam_from_output
         if self.enable_stabilization and self.imu_orientation is not None:
             R = R * self.imu_orientation.leveling_at(frame_num / self.meta.fps)
         return R
@@ -1957,22 +2131,25 @@ class X5Pipeline:
 
         return fw, bw
 
-    def stitch_frame(self, frame_num=0, frames=None):
+    def stitch_frame(self, frame_num=0, frames=None, cam_from_output=None, grid=None):
         """
         Stitch a single frame with depth-aware translation correction.
 
-        Pass `frames` as a (front, back) pair to reuse an open
-        InsvFrameReader; otherwise one is opened for this frame alone.
-        Returns a numpy image, whichever device stitched it.
+        Pass `frames` as a (front, back) pair to reuse an open frame reader;
+        otherwise one is opened for this frame alone. cam_from_output turns
+        the output (see _seam_from_output) and grid (a RayGrid, by default the
+        equirectangular output) sets its pixels. Returns a numpy image,
+        whichever device stitched it.
         """
-        return self._begin_frame(frame_num, frames)()
+        return self._begin_frame(frame_num, frames, ((cam_from_output, grid),))()[0]
 
-    def _begin_frame(self, frame_num, frames):
+    def _begin_frame(self, frame_num, frames, views=((None, None),)):
         """
         stitch_frame up to the parallax flow, which is left computing on a CPU
-        thread; returns the function that finishes the frame. The next frame
-        may begin before it is called: the GPU then stitches that frame while
-        the CPU computes this one's flow.
+        thread; returns the function that finishes the frame into one image
+        per (cam_from_output, grid) of views (see stitch_views). The next
+        frame may begin before it is called: the GPU then stitches that frame
+        while the CPU computes this one's flow.
         """
         t0 = time.time()
         xp = self.xp
@@ -1982,18 +2159,16 @@ class X5Pipeline:
         # take 82 ms and 0.28 CPU-seconds at 3840 px, all 24 CPUs 71 ms and
         # 0.44: the stitch never waits for them, but decoding and the flow
         # do share the CPU.
-        R_out = self._seam_from_output(frame_num)
-        out_maps = _side_thread('rotation').submit(
-            equirect_rotation_maps, R_out, self.st_w, self.st_h,
-            self.eq_w, self.eq_h, self.out_rays, blocks=4)
+        out_maps = [_side_thread('rotation').submit(
+            equirect_rotation_maps, self._seam_from_output(frame_num, view),
+            self.st_w, self.st_h, grid.width, grid.height, grid.rays, blocks=4)
+            for view, grid in ((v, g or self.out_grid) for v, g in views)]
 
         if self.imu_orientation is not None:
             self._build_maps(frame_num)
 
         if frames is None:
-            with InsvFrameReader(self.insv_path, self.meta.width,
-                                 self.meta.height, self.meta.fps,
-                                 frame_num) as reader:
+            with self.open_reader(frame_num) as reader:
                 frames = reader.read()
             if frames is None:
                 raise RuntimeError(f"Decode failed: no frame {frame_num}")
@@ -2076,24 +2251,29 @@ class X5Pipeline:
                 result[flow_rows] = xp.clip(xp.swapaxes(blended, 0, 1)[:, hw:-hw],
                                             0, 255).astype(xp.uint8)
 
-            # Turn the stitch from the seam frame to the output
-            out = to_numpy(rotate_equirect(result, R_out, self.eq_w, self.eq_h,
-                                           maps=out_maps.result()))
+            # Turn the stitch from the seam frame to each output
+            outs = [to_numpy(rotate_equirect(result, None, maps=maps.result()))
+                    for maps in out_maps]
 
             # Optional edge-preserving denoise (bilateral filter)
             if self.denoise:
-                out = cv2.bilateralFilter(out, 9, 40, 40)
+                outs = [cv2.bilateralFilter(out, 9, 40, 40) for out in outs]
 
             dt = time.time() - t0
-            print(f"Frame {frame_num}: {dt:.2f}s")
-            return out
+            log.info(f"Frame {frame_num}: {dt:.2f}s")
+            return outs
 
         return finish
+
+    def open_reader(self, start_frame=0):
+        """A frame reader on this pipeline's fisheyes, from start_frame on."""
+        return self.frame_reader(self.frame_path, self.frame_w, self.frame_h,
+                                 self.meta.fps, start_frame)
 
     def stitch_frame_to_file(self, frame_num, output_path):
         result = self.stitch_frame(frame_num)
         cv2.imwrite(output_path, result)
-        print(f"Saved: {output_path}")
+        log.info(f"Saved: {output_path}")
         return result
 
     def stitch_frames(self, start, end):
@@ -2102,19 +2282,49 @@ class X5Pipeline:
         decoded ahead on a thread; each frame begins while the previous one's
         parallax flow is computed.
         """
-        reader = InsvFrameReader(self.insv_path, self.meta.width,
-                                 self.meta.height, self.meta.fps, start)
+        for _, (image,) in self.stitch_views((n, ((None, None),)) for n in range(start, end)):
+            yield image
+
+    def stitch_views(self, frame_views, seek_gap=90):
+        """
+        Yield (frame_num, images) for each (frame_num, views) of frame_views,
+        views being (cam_from_output, grid) pairs and images the stitch turned
+        by each cam_from_output (None for the default, see _seam_from_output)
+        through its grid (a RayGrid, None for the equirectangular output).
+        Frame numbers increase strictly. Frames are decoded ahead on a thread: those in
+        between are decoded and dropped, and a gap of more than seek_gap
+        frames seeks instead (at 3840 px a seek costs about 3 s, 75 frames
+        read in order). Each frame begins while the previous one's parallax
+        flow is computed. Stops at the end of the stream.
+        """
+        frame_views = list(frame_views)
+        reader = [None]
+
+        def read():
+            n = numbers.pop()
+            r = reader[0]
+            if r is None or n - r.next_index > seek_gap:
+                if r is not None:
+                    r.close()
+                r = reader[0] = self.open_reader(n)
+            while r.next_index < n:
+                if r.read() is None:
+                    return None
+            return r.read()
+
+        numbers = [n for n, _ in reversed(frame_views)]
         finish = None
         try:
-            for n, pair in enumerate(read_ahead(reader.read, end - start), start):
-                begun = self._begin_frame(n, pair)
+            for (n, views), pair in zip(frame_views, read_ahead(read, len(frame_views))):
+                begun = self._begin_frame(n, pair, views)
                 if finish is not None:
-                    yield finish()
-                finish = begun
+                    yield finish_n, finish()
+                finish, finish_n = begun, n
             if finish is not None:
-                yield finish()
+                yield finish_n, finish()
         finally:
-            reader.close()
+            if reader[0] is not None:
+                reader[0].close()
 
     def stitch_video(self, output_path, start=0, end=-1):
         """
@@ -2126,17 +2336,7 @@ class X5Pipeline:
         if end == -1:
             end = self.meta.frame_count
 
-        # Use ffmpeg pipe for H.264 output (much better compression than mp4v)
-        cmd = [
-            'ffmpeg', '-y', '-loglevel', 'warning',
-            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-            '-s', f'{self.eq_w}x{self.eq_h}',
-            '-r', str(self.meta.fps),
-            '-i', 'pipe:0',
-            '-c:v', 'libx264', '-preset', 'medium',
-            '-crf', '18', '-pix_fmt', 'yuv420p',
-            output_path
-        ]
+        cmd = h264_command(self.eq_w, self.eq_h, self.meta.fps, output_path)
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
         t_total = time.time()
@@ -2151,11 +2351,11 @@ class X5Pipeline:
             proc.stdin.close()
             proc.wait()
         if n < end:
-            print(f"  stream ended early at frame {n}")
+            log.info(f"  stream ended early at frame {n}")
             end = n
         dt = time.time() - t_total
         n_frames = end - start
-        print(f"Video saved: {output_path} "
+        log.info(f"Video saved: {output_path} "
               f"({n_frames} frames in {dt:.1f}s, {n_frames/dt:.1f} fps)")
 
 
@@ -2165,11 +2365,7 @@ class X5Pipeline:
 
 def extract_gt_frame(gt_path, frame_num=0):
     """Extract a frame from ground truth video."""
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-           '-show_entries', 'stream=width,height', '-of', 'csv=p=0', gt_path]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    parts = [p for p in r.stdout.strip().split(',') if p]
-    w, h = int(parts[0]), int(parts[1])
+    w, h = video_size(gt_path)
 
     cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-i', gt_path,
            '-vf', f'select=eq(n\\,{frame_num})',
@@ -2221,6 +2417,7 @@ if __name__ == '__main__':
                         help='Where to stitch (default: the GPU when CuPy '
                              'finds one, else the CPU)')
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     pipeline = X5Pipeline(args.input, eq_width=args.width,
                           enable_stabilization=not args.no_stab,

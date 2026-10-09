@@ -275,6 +275,9 @@ two halves: `_begin_frame` stitches up to the parallax band and leaves DIS flow 
 on the CPU, and the function it returns warps the band, turns the stitch to the output and
 downloads it. `stitch_frames` begins frame n before finishing frame n − 1, so the GPU
 stitches while the CPU computes the flow; it yields the same images as `stitch_frame`.
+`stitch_views` runs the same loop over any increasing frames, each turned into one or more
+outputs through its own rotation and ray grid; frames in between are decoded and dropped, and
+gaps of more than 90 frames seek instead.
 
 Decoded frames come through a 64 MB pipe on Windows. The default pipe buffer split each
 3840×3840 frame into 1350 reads, each taking the GIL back: reading a pair of frames took

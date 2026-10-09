@@ -66,6 +66,18 @@ uv run python x5_pipeline.py input.insv --gt studio_render.mp4 -o output.jpg
 uv run python x5_pipeline.py input.insv -o output.mp4 --video --device cpu
 ```
 
+## Library use
+
+`X5Pipeline` also serves as a library:
+
+- `frame_source='lrv'` stitches the `.lrv` preview recorded with the `.insv`, two 1024 px fisheyes side by side, with the calibration scaled by `lens_at_size`.
+- `meta` and `imu_orientation` take `extract_metadata` and `compute_stabilization_from_imu` results already at hand, so several pipelines on one rush parse its telemetry once.
+- `stitch_frame(frame, cam_from_output=R, grid=RayGrid(rays, w, h))` turns the output by a camera-from-output rotation and samples it through any grid of unit rays: perspective views, fisheyes, little planets.
+- `stitch_views(frame_views)` stitches increasing frames, each turned into several outputs, decoding ahead, dropping the frames in between and seeking over long gaps.
+- `ImuOrientation.camera_heading` and `leveling_at(t, turn)` give the heading about gravity and a level output turned to any heading.
+
+Progress goes to the `x5_pipeline` logger; the command line shows its INFO messages.
+
 ## Speed
 
 X6 clip, 3840 output stitched at 5760, stabilization and flow on, Core Ultra 9 275HX with an RTX 5090 Laptop GPU:
